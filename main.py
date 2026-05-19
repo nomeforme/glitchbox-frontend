@@ -503,6 +503,16 @@ class MainWindow(QMainWindow):
             self.ws_client_v2.capabilities_received.connect(
                 self.control_panel.apply_capabilities
             )
+            # V2 handshake-complete also triggers ProcessedDisplay's ZMQ
+            # subscriber. Without this, the server emits rendered frames
+            # on tcp://*:5555 but the client never subscribes to the
+            # pubsub, so the output window stays blank even though the
+            # GPU is actively rendering. (Legacy parity: V1 wires this
+            # off handle_settings, which the realtime server never
+            # triggers — its /api/settings returns 404.)
+            self.ws_client_v2.capabilities_received.connect(
+                self._v2_on_capabilities
+            )
             self.ws_client_v2.connection_error.connect(self.handle_connection_error)
             self.ws_client_v2.status_changed.connect(self.handle_status_change)
             # Live-knob updates flow control_panel → ws_client_v2.update_knob
@@ -856,6 +866,31 @@ class MainWindow(QMainWindow):
             self.ws_client_v2.send_frame(buf.tobytes(), self._v2_latest_pcm)
         except Exception as e:
             print(f"[V2] send_frame error: {e}")
+
+    def _v2_on_capabilities(self, caps):
+        """V2 handshake-complete handler — kicks the ZMQ subscriber so
+        rendered frames from the server's tcp://*:5555 publisher land in
+        ProcessedDisplay.update_frame. Mirrors the parts of the legacy
+        handle_settings() that aren't already covered by
+        ControlPanel.apply_capabilities."""
+        self.server_connected = True
+        self.connect_button.setEnabled(False)
+        self.disconnect_button.setEnabled(True)
+        self.reconnect_button.setEnabled(False)
+        self.status_bar.update_processing_status(
+            f"V2 connected: {self.server_host}:{self.server_port}"
+        )
+        self.reconnection_count = 0
+        # Kick ProcessedDisplay's ZMQ subscriber. The legacy StreamThread
+        # spawned alongside will harmlessly 404 against the realtime
+        # server's nonexistent /api/stream/{user_id} endpoint; only the
+        # ZMQ subscriber matters for V2 output.
+        print("[UI/V2] Capabilities received — starting ProcessedDisplay ZMQ subscriber")
+        try:
+            self.processed_display.stop_stream()
+            QTimer.singleShot(100, self._start_fresh_stream)
+        except Exception as e:
+            print(f"[UI/V2] Error starting fresh stream: {e}")
 
     def _v2_handle_alpha(self, alpha: float, w_a: float, w_b: float):
         """Render the audio-driven α + LoRA-blend weights into the
