@@ -384,7 +384,14 @@ class MainWindow(QMainWindow):
         self.fft_button = QPushButton("Start Audio FFT")
         self.fft_button.clicked.connect(self.toggle_fft)
         buttons_layout.addWidget(self.fft_button)
-        
+
+        # NOTE: ProjectionMapper has its own toggle button inside
+        # ProcessedDisplay ("Projection Mapper" button, see
+        # components/processed_display.py:222). Frames are routed to the
+        # mapper from ProcessedDisplay.update_frame() — so it works
+        # transparently across both V1 (WS frame_received) and V2 (ZMQ)
+        # output paths. No additional wiring in main.py needed.
+
         # Add buttons layout to controls
         controls_layout.addLayout(buttons_layout)
         
