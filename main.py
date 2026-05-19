@@ -591,6 +591,14 @@ class MainWindow(QMainWindow):
             print(f"[UI] WebSocket client user_id: {self.ws_client.user_id}")
             self.ws_client.start()
             print("[UI] WebSocket client start() called successfully")
+            # V2 parallel-path start. The legacy client above hits the
+            # glitchbox-server endpoints (/api/settings, /api/ws/{id}); the
+            # V2 client hits the realtime endpoints (/defaults, /live).
+            # Both run in parallel during cutover so the UI keeps working
+            # against either backend, controlled by GLITCHBOX_REALTIME_V2.
+            if REALTIME_V2 and hasattr(self, "ws_client_v2"):
+                print("[UI] Starting V2 WSClient (realtime protocol)")
+                self.ws_client_v2.start()
         except Exception as e:
             print(f"[UI] Error starting WebSocket client: {e}")
             self.status_bar.update_processing_status(f"Failed to start connection: {e}")
