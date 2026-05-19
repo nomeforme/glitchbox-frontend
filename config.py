@@ -2,6 +2,8 @@
 Configuration settings for the Glitch Machine Engine.
 """
 
+import os
+
 # Display and camera dimensions
 DISPLAY_WIDTH = 1024
 DISPLAY_HEIGHT = 768
@@ -11,7 +13,14 @@ MIC_DEVICE_INDEX = 0 #16
 MAX_CAMERA_INDEX = 50  # Maximum camera index to check (supports virtual cameras like /dev/video42)
 
 # Speech-to-text settings
-STT_DEVICE = "cuda"  # Device for STT processing: "cpu" or "cuda"
+# STT is OFF by default. Set GLITCHBOX_STT_ENABLED=1 in the environment
+# (shell export, NOT .env — config is imported before load_dotenv runs)
+# to enable it. When disabled, SpeechToTextThread is never instantiated
+# and the UI button is hidden, so no CUDA / RealtimeSTT runtime path is
+# touched. The packages are still installed by uv sync — only runtime
+# usage is gated.
+STT_ENABLED = os.getenv("GLITCHBOX_STT_ENABLED", "0") == "1"
+STT_DEVICE = "cuda"  # Device for STT processing: "cpu" or "cuda" (only used when STT_ENABLED)
 
 # Audio settings
 NUM_FFT_BINS = 50

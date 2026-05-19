@@ -21,7 +21,7 @@ from components import StatusBar
 from components.video_display import VideoDisplay
 from clients import WebSocketClient
 from threads import CameraThread, SpeechToTextThread, FFTAnalyzerThread, VideoThread, VideoAudioThread
-from config import MIC_DEVICE_INDEX, AUTO_DISABLE_BLACK_FRAME_AFTER_CURATION_UPDATE, BLACK_FRAME_DISABLE_TIMEOUT, FORCE_MANUAL_RECONNECTION_AFTER_CURATION_UPDATE, CAMERA_DEVICE_INDEX, CURATION_INDEX_AUTO_UPDATE, CURATION_INDEX_UPDATE_TIME, CURATION_INDEX_MAX, MAX_CAMERA_INDEX
+from config import MIC_DEVICE_INDEX, AUTO_DISABLE_BLACK_FRAME_AFTER_CURATION_UPDATE, BLACK_FRAME_DISABLE_TIMEOUT, FORCE_MANUAL_RECONNECTION_AFTER_CURATION_UPDATE, CAMERA_DEVICE_INDEX, CURATION_INDEX_AUTO_UPDATE, CURATION_INDEX_UPDATE_TIME, CURATION_INDEX_MAX, MAX_CAMERA_INDEX, STT_ENABLED
 from utils.list_cameras import test_camera, get_device_info
 
 # --- Realtime protocol (V2) integration ---------------------------------
@@ -375,10 +375,14 @@ class MainWindow(QMainWindow):
         # Camera button is now always enabled
         buttons_layout.addWidget(self.start_button)
         
-        # STT Toggle button
-        self.stt_button = QPushButton("Start Speech Recognition")
-        self.stt_button.clicked.connect(self.toggle_stt)
-        buttons_layout.addWidget(self.stt_button)
+        # STT Toggle button (gated by STT_ENABLED — hidden by default,
+        # enable with GLITCHBOX_STT_ENABLED=1 in the environment).
+        if STT_ENABLED:
+            self.stt_button = QPushButton("Start Speech Recognition")
+            self.stt_button.clicked.connect(self.toggle_stt)
+            buttons_layout.addWidget(self.stt_button)
+        else:
+            self.stt_button = None
         
         # FFT Toggle button
         self.fft_button = QPushButton("Start Audio FFT")
@@ -449,9 +453,15 @@ class MainWindow(QMainWindow):
         # Set the camera device index
         self.camera_thread.device_index = self.camera_device_index
 
-        # Initialize the STT thread with the audio device index
-        self.stt_thread = SpeechToTextThread(input_device_index=self.audio_device_index)
-        self.stt_thread.transcription_updated.connect(self.handle_transcription)
+        # Initialize the STT thread with the audio device index (gated by STT_ENABLED).
+        # When disabled, self.stt_thread stays None — existing cleanup paths use
+        # `hasattr(...) and self.stt_thread is not None` so they short-circuit safely.
+        if STT_ENABLED:
+            self.stt_thread = SpeechToTextThread(input_device_index=self.audio_device_index)
+            self.stt_thread.transcription_updated.connect(self.handle_transcription)
+        else:
+            self.stt_thread = None
+            print("[UI] STT disabled (set GLITCHBOX_STT_ENABLED=1 to enable)")
         self.stt_active = False
         
         # Initialize the FFT thread with the audio device index
@@ -1214,9 +1224,12 @@ class MainWindow(QMainWindow):
         self.camera_thread.device_index = self.camera_device_index
         self.camera_thread.frame_ready.connect(self.handle_camera_frame)
         
-        # Recreate STT thread
-        self.stt_thread = SpeechToTextThread(input_device_index=self.audio_device_index)
-        self.stt_thread.transcription_updated.connect(self.handle_transcription)
+        # Recreate STT thread (gated by STT_ENABLED)
+        if STT_ENABLED:
+            self.stt_thread = SpeechToTextThread(input_device_index=self.audio_device_index)
+            self.stt_thread.transcription_updated.connect(self.handle_transcription)
+        else:
+            self.stt_thread = None
         
         # Recreate FFT thread
         self.fft_thread = FFTAnalyzerThread(input_device_index=self.audio_device_index)
@@ -1237,7 +1250,8 @@ class MainWindow(QMainWindow):
         self.disconnect_button.setEnabled(False)  # Disable disconnect when disconnected
         self.reconnect_button.setEnabled(True)  # Enable reconnect when disconnected
         self.stt_active = False
-        self.stt_button.setText("Start Speech Recognition")
+        if self.stt_button is not None:
+            self.stt_button.setText("Start Speech Recognition")
         self.fft_active = False
         self.fft_button.setText("Start Audio FFT")
         
@@ -1266,6 +1280,10 @@ class MainWindow(QMainWindow):
 
     def toggle_stt(self):
         """Toggle speech-to-text processing"""
+        if not STT_ENABLED or self.stt_thread is None:
+            print("[UI] STT is disabled — set GLITCHBOX_STT_ENABLED=1 to enable")
+            self.status_bar.update_processing_status("Speech recognition disabled (GLITCHBOX_STT_ENABLED=0)")
+            return
         if not self.stt_active:
             # Start STT
             self.stt_thread.start()
@@ -1278,7 +1296,7 @@ class MainWindow(QMainWindow):
             self.stt_active = False
             self.stt_button.setText("Start Speech Recognition")
             self.status_bar.update_processing_status("Speech recognition stopped")
-            
+
             # Recreate the STT thread for next use (QThread cannot be restarted)
             self.stt_thread = SpeechToTextThread(input_device_index=self.audio_device_index)
             self.stt_thread.transcription_updated.connect(self.handle_transcription)
@@ -1877,10 +1895,13 @@ class MainWindow(QMainWindow):
             # Update the index
             self.audio_device_index = new_index
             
-            # Recreate audio threads with new index
-            self.stt_thread = SpeechToTextThread(input_device_index=self.audio_device_index)
-            self.stt_thread.transcription_updated.connect(self.handle_transcription)
-            
+            # Recreate audio threads with new index (STT gated by STT_ENABLED)
+            if STT_ENABLED:
+                self.stt_thread = SpeechToTextThread(input_device_index=self.audio_device_index)
+                self.stt_thread.transcription_updated.connect(self.handle_transcription)
+            else:
+                self.stt_thread = None
+
             self.fft_thread = FFTAnalyzerThread(input_device_index=self.audio_device_index)
             self.fft_thread.fft_data_updated.connect(self.handle_fft_data)
             
