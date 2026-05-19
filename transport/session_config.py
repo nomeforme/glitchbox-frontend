@@ -120,6 +120,15 @@ class SessionConfig:
     audio_band: str = "treble"          # mel band driving reactivity
     h_smoothing: bool = False           # JJ baseline: latent_carryover instead
 
+    # ----- Audio capture contract -----
+    # The client captures PCM s16le mono at this rate; the server's
+    # RealtimeFFTAudioAnalyzer is constructed with the same value via the
+    # SessionConfig handshake. Mismatch → silent garbage FFT. Defaults to
+    # the server's default (44100) so handshakes that omit the field
+    # round-trip to the same rate on both sides.
+    sample_rate: int = 44100
+    fps: int = 20                       # informs server's samples_per_chunk
+
     # ----- Caller-supplied per-session overrides (orchestrator fills) -----
     # Left as None on the bare default; the orchestrator passes them in
     # from the caller (e.g. plantoid16 installation defaults).

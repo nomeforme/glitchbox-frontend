@@ -501,10 +501,13 @@ class MainWindow(QMainWindow):
             # Live-knob updates flow control_panel → ws_client_v2.update_knob
             self.control_panel.knob_changed.connect(self.ws_client_v2.update_knob)
 
-            # Audio thread (raw PCM, no client-side FFT).
+            # Audio thread (raw PCM, no client-side FFT). Sample rate
+            # MUST match SessionConfig.sample_rate — the server
+            # constructs RealtimeFFTAudioAnalyzer with the same value
+            # from the handshake. Drift → silent garbage-FFT.
             self.audio_thread = AudioThread(
                 input_device_index=self.audio_device_index,
-                sample_rate=44100,
+                sample_rate=self.session_cfg.sample_rate,
                 chunk_ms=50,
             )
             self.audio_thread.pcm_chunk_ready.connect(self._v2_handle_pcm_chunk)
@@ -514,6 +517,11 @@ class MainWindow(QMainWindow):
             # send at most one packet per rendered frame).
             self._v2_latest_pcm = b""
             self.camera_thread.frame_ready.connect(self._v2_handle_camera_frame)
+
+            # Alpha telemetry → status bar (throttled to ~1 Hz so we
+            # don't spam the UI at 20-30 fps).
+            self._v2_alpha_throttle = 0
+            self.ws_client_v2.alpha_updated.connect(self._v2_handle_alpha)
         # --------------------------------------------------------------
         
         # Track signal connections to prevent duplication
@@ -833,6 +841,17 @@ class MainWindow(QMainWindow):
             self.ws_client_v2.send_frame(buf.tobytes(), self._v2_latest_pcm)
         except Exception as e:
             print(f"[V2] send_frame error: {e}")
+
+    def _v2_handle_alpha(self, alpha: float, w_a: float, w_b: float):
+        """Render the audio-driven α + LoRA-blend weights into the
+        status bar. Throttled to roughly 1 Hz at 20-30 fps."""
+        self._v2_alpha_throttle += 1
+        if self._v2_alpha_throttle < 20:
+            return
+        self._v2_alpha_throttle = 0
+        self.status_bar.update_processing_status(
+            f"streaming · α={alpha:.2f}  w_a={w_a:.2f}  w_b={w_b:.2f}"
+        )
     # --------------------------------------------------------------------
 
     def handle_video_frame(self, frame):
@@ -2175,6 +2194,13 @@ class MainWindow(QMainWindow):
         else:
             # Start camera mode (original behavior)
             self.camera_thread.start()
+            # V2 requires the raw-PCM AudioThread running in parallel —
+            # the camera frame is the dispatch trigger but each frame
+            # carries the most-recent PCM chunk as its audio tail. If
+            # AudioThread isn't started, _v2_latest_pcm stays b"" and
+            # every frame ships silent audio.
+            if REALTIME_V2:
+                self.audio_thread.start()
             self.frame_timer.start()
             self.camera_running = True
             self.start_button.setText("Stop Camera")
@@ -2220,6 +2246,10 @@ class MainWindow(QMainWindow):
                 else:
                     # Stop camera thread
                     self.camera_thread.stop()
+                    # V2: also stop the parallel raw-PCM audio thread.
+                    if REALTIME_V2:
+                        self.audio_thread.stop()
+                        self._v2_latest_pcm = b""
                 
                 # Stop server streaming if connected (non-blocking)
                 if self.server_connected:
