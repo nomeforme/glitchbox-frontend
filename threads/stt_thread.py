@@ -1,6 +1,11 @@
-from RealtimeSTT import AudioToTextRecorder
 from PySide6.QtCore import QThread, Signal
 from config import STT_DEVICE
+
+# Lazy: RealtimeSTT pulls in ctranslate2 / faster-whisper / CUDA libs,
+# so we only import it when SpeechToTextThread is actually instantiated.
+# This lets the rest of the app launch on machines without that stack.
+AudioToTextRecorder = None  # type: ignore[assignment]
+
 
 class SpeechToTextThread(QThread):
     """Thread for handling real-time speech-to-text processing"""
@@ -10,6 +15,13 @@ class SpeechToTextThread(QThread):
     
     def __init__(self, input_device_index=None):
         super().__init__()
+        # Resolve RealtimeSTT lazily — first instantiation triggers the
+        # import. Raises a clean ImportError here if the package is
+        # missing, instead of failing at module import time.
+        global AudioToTextRecorder
+        if AudioToTextRecorder is None:
+            from RealtimeSTT import AudioToTextRecorder as _ATR
+            AudioToTextRecorder = _ATR
         self.input_device_index = input_device_index
         self.recorder = None
         self.running = False

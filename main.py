@@ -492,17 +492,19 @@ class MainWindow(QMainWindow):
         self.camera_thread.frame_ready.connect(self.handle_camera_frame)
 
         # --- Realtime V2 wiring ---------------------------------------
-        # Build a SessionConfig from defaults (server-side
-        # `_p16stage3_final.yaml`), construct a parallel WSClient, and
-        # wire the per-frame joiner. The legacy ws_client/fft_thread
-        # objects above are left alive but disabled under the feature
-        # flag — `start_camera()` / connect handlers pick the right one.
-        # TODO: optionally hydrate SessionConfig from
-        #   GET http://{host}:{port}/api/installations/plantoid16/defaults
-        #   (Agent C exposes this endpoint). For now we use built-in
-        #   dataclass defaults, which already match the manifest.
+        # Build a SessionConfig from server-side defaults (the realtime
+        # server's /api/installations/plantoid16/defaults endpoint),
+        # construct a WSClient, and wire the per-frame joiner. The
+        # GLITCHBOX_PRESET env var picks which preset to fetch — the
+        # default 'vanilla' is a minimal img2img baseline; 'plantoid16'
+        # is the rich paired-LoRA / audio-reactive / ControlNet-depth
+        # preset (use this once the vanilla baseline produces correct
+        # output and you want the full plantoid 16 experience).
         if REALTIME_V2:
-            self.session_cfg = SessionConfig()
+            preset = os.getenv("GLITCHBOX_PRESET", "vanilla")
+            self.session_cfg = self._fetch_session_config(
+                server_host, server_port, preset
+            )
             self.ws_client_v2 = WSClient(
                 host=server_host,
                 port=int(server_port),
@@ -854,6 +856,30 @@ class MainWindow(QMainWindow):
         self.camera_display.update_frame(frame)
 
     # --- Realtime V2 helpers --------------------------------------------
+    def _fetch_session_config(self, host: str, port, preset: str) -> SessionConfig:
+        """GET /api/installations/plantoid16/defaults?preset=... and
+        hydrate a SessionConfig from the response. Falls back to the
+        dataclass defaults if the server is unreachable so the UI still
+        launches and the user can manually retry the Connect step.
+        """
+        import requests
+        url = f"http://{host}:{port}/api/installations/plantoid16/defaults"
+        print(f"[V2] Fetching session config from {url}?preset={preset}")
+        try:
+            r = requests.get(url, params={"preset": preset}, timeout=5)
+            r.raise_for_status()
+            cfg = SessionConfig.from_dict(r.json())
+            print(f"[V2] Loaded '{preset}' preset: "
+                  f"{cfg.width}×{cfg.height}, lora={cfg.lora!r}, "
+                  f"controlnet={cfg.controlnet}, "
+                  f"feedback_strength={cfg.feedback_strength}, "
+                  f"latent_carryover={cfg.latent_carryover}")
+            return cfg
+        except Exception as exc:
+            print(f"[V2] /defaults fetch failed ({exc}); using "
+                  f"dataclass defaults")
+            return SessionConfig()
+
     def _v2_handle_pcm_chunk(self, pcm_bytes: bytes):
         """Stash the most recent PCM chunk for the next camera frame."""
         self._v2_latest_pcm = pcm_bytes
