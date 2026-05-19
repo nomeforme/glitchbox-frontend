@@ -12,10 +12,18 @@ class ControlPanel(QWidget):
     """Widget containing pipeline controls and settings"""
 
     parameter_changed = Signal(str, object)  # (param_id, value)
+    # Realtime-protocol live-knob signal: emitted only for fields the
+    # server marked `live_adjustable` in its session_ready capabilities.
+    # `main.py` wires this to `WSClient.update_knob`.
+    knob_changed = Signal(str, object)       # (field, value)
 
     def __init__(self):
         super().__init__()
         self.controls = {}
+        # Capabilities map from the realtime server's session_ready ack.
+        # Populated by `apply_capabilities`; empty dict = no classification
+        # known yet (= legacy behavior: every field is freely adjustable).
+        self._capabilities = {"live_adjustable": [], "frozen": []}
 
         # Create outer layout
         outer_layout = QVBoxLayout(self)
@@ -175,6 +183,67 @@ class ControlPanel(QWidget):
                 widget.deleteLater()
             elif item.layout():
                 self.clear_layout(item.layout())
+
+    def apply_capabilities(self, caps: dict):
+        """Apply realtime-protocol capabilities to the existing controls.
+
+        Expected shape (from the server's `session_ready` ack):
+            {
+              "live_adjustable": ["cn_scale", "audio_reaction_output_gain", ...],
+              "frozen": ["width", "height", "strength", "num_inference_steps", ...]
+            }
+
+        Behavior per field:
+            * frozen          → disable + visually grey out (read-only).
+            * live_adjustable → ensure enabled; rewire `valueChanged` to
+                                emit `knob_changed(field, value)` so
+                                main.py can forward to ws_client.update_knob.
+            * unclassified    → leave existing behavior intact
+                                (non-breaking for legacy fields).
+        """
+        self._capabilities = {
+            "live_adjustable": list(caps.get("live_adjustable", [])),
+            "frozen": list(caps.get("frozen", [])),
+        }
+        frozen = set(self._capabilities["frozen"])
+        live = set(self._capabilities["live_adjustable"])
+
+        for param_id, control in self.controls.items():
+            if param_id in frozen:
+                self._set_control_enabled(control, False)
+                continue
+            if param_id in live:
+                self._set_control_enabled(control, True)
+                self._wire_live_knob(param_id, control)
+
+    def _set_control_enabled(self, control, enabled: bool):
+        """Enable / disable a control (handles slider tuples + widgets)."""
+        if isinstance(control, tuple):  # (slider, value_edit)
+            for w in control:
+                w.setEnabled(enabled)
+        else:
+            control.setEnabled(enabled)
+
+    def _wire_live_knob(self, param_id: str, control):
+        """Emit `knob_changed` for live-adjustable fields.
+
+        Note: we keep the existing `parameter_changed` wiring intact;
+        `knob_changed` fires in addition, so the legacy path still
+        works under the V2=0 feature flag.
+        """
+        if isinstance(control, tuple):  # slider
+            slider, _ = control
+            slider.valueChanged.connect(
+                lambda v, pid=param_id: self.knob_changed.emit(pid, v / 100)
+            )
+        elif isinstance(control, QCheckBox):
+            control.stateChanged.connect(
+                lambda v, pid=param_id: self.knob_changed.emit(pid, bool(v))
+            )
+        elif isinstance(control, QLineEdit):
+            control.textChanged.connect(
+                lambda v, pid=param_id: self.knob_changed.emit(pid, v)
+            )
 
     def update_control(self, param_id, value):
         """Update a control's value programmatically"""

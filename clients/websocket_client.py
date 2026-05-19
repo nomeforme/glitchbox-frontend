@@ -1,3 +1,4 @@
+"""DEPRECATED: legacy frontend protocol client; replaced by `transport/ws_client.WSClient` for the realtime protocol. Kept for `GLITCHBOX_REALTIME_V2=0` fallback only."""
 from PySide6.QtCore import QThread, Signal
 import asyncio
 import websockets

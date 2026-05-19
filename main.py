@@ -23,6 +23,17 @@ from clients import WebSocketClient
 from threads import CameraThread, SpeechToTextThread, FFTAnalyzerThread, VideoThread, VideoAudioThread
 from config import MIC_DEVICE_INDEX, AUTO_DISABLE_BLACK_FRAME_AFTER_CURATION_UPDATE, BLACK_FRAME_DISABLE_TIMEOUT, FORCE_MANUAL_RECONNECTION_AFTER_CURATION_UPDATE, CAMERA_DEVICE_INDEX, CURATION_INDEX_AUTO_UPDATE, CURATION_INDEX_UPDATE_TIME, CURATION_INDEX_MAX, MAX_CAMERA_INDEX
 from utils.list_cameras import test_camera, get_device_info
+
+# --- Realtime protocol (V2) integration ---------------------------------
+# Toggle the V2 path with `GLITCHBOX_REALTIME_V2=0` to fall back to the
+# legacy WebSocketClient + FFTAnalyzerThread codepath (still imported
+# above). Default is V2 (1).
+REALTIME_V2 = os.getenv("GLITCHBOX_REALTIME_V2", "1") == "1"
+if REALTIME_V2:
+    from transport import SessionConfig, WSClient
+    from threads.audio_thread import AudioThread
+# ------------------------------------------------------------------------
+
 load_dotenv(override=True)
 
 # Default server configuration
@@ -462,6 +473,48 @@ class MainWindow(QMainWindow):
         self.ws_client.status_changed.connect(self.handle_status_change)
         self.ws_client.param_updated.connect(self.handle_param_update)
         self.camera_thread.frame_ready.connect(self.handle_camera_frame)
+
+        # --- Realtime V2 wiring ---------------------------------------
+        # Build a SessionConfig from defaults (server-side
+        # `_p16stage3_final.yaml`), construct a parallel WSClient, and
+        # wire the per-frame joiner. The legacy ws_client/fft_thread
+        # objects above are left alive but disabled under the feature
+        # flag — `start_camera()` / connect handlers pick the right one.
+        # TODO: optionally hydrate SessionConfig from
+        #   GET http://{host}:{port}/api/installations/plantoid16/defaults
+        #   (Agent C exposes this endpoint). For now we use built-in
+        #   dataclass defaults, which already match the manifest.
+        if REALTIME_V2:
+            self.session_cfg = SessionConfig()
+            self.ws_client_v2 = WSClient(
+                host=server_host,
+                port=int(server_port),
+                max_retries=10,
+                initial_retry_delay=1.0,
+            )
+            self.ws_client_v2.configure(self.session_cfg)
+            self.ws_client_v2.capabilities_received.connect(
+                self.control_panel.apply_capabilities
+            )
+            self.ws_client_v2.connection_error.connect(self.handle_connection_error)
+            self.ws_client_v2.status_changed.connect(self.handle_status_change)
+            # Live-knob updates flow control_panel → ws_client_v2.update_knob
+            self.control_panel.knob_changed.connect(self.ws_client_v2.update_knob)
+
+            # Audio thread (raw PCM, no client-side FFT).
+            self.audio_thread = AudioThread(
+                input_device_index=self.audio_device_index,
+                sample_rate=44100,
+                chunk_ms=50,
+            )
+            self.audio_thread.pcm_chunk_ready.connect(self._v2_handle_pcm_chunk)
+
+            # Joiner state: keep the most recent PCM chunk, pair on each
+            # camera frame (camera tick is the dispatch trigger so we
+            # send at most one packet per rendered frame).
+            self._v2_latest_pcm = b""
+            self.camera_thread.frame_ready.connect(self._v2_handle_camera_frame)
+        # --------------------------------------------------------------
         
         # Track signal connections to prevent duplication
         self.signal_connections_active = True
@@ -756,6 +809,31 @@ class MainWindow(QMainWindow):
         """Handle new frame from camera"""
         self.current_frame = frame
         self.camera_display.update_frame(frame)
+
+    # --- Realtime V2 helpers --------------------------------------------
+    def _v2_handle_pcm_chunk(self, pcm_bytes: bytes):
+        """Stash the most recent PCM chunk for the next camera frame."""
+        self._v2_latest_pcm = pcm_bytes
+
+    def _v2_handle_camera_frame(self, frame):
+        """Encode camera frame as JPEG and ship with the most recent PCM.
+
+        The camera frame is the dispatch trigger (one packet per frame).
+        """
+        if not REALTIME_V2:
+            return
+        if not getattr(self, "ws_client_v2", None) or not self.ws_client_v2.connected:
+            return
+        try:
+            # camera_thread emits RGB; encode as JPEG (BGR for cv2).
+            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            ok, buf = cv2.imencode(".jpg", bgr)
+            if not ok:
+                return
+            self.ws_client_v2.send_frame(buf.tobytes(), self._v2_latest_pcm)
+        except Exception as e:
+            print(f"[V2] send_frame error: {e}")
+    # --------------------------------------------------------------------
 
     def handle_video_frame(self, frame):
         """Handle new frame from video"""

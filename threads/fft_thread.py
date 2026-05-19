@@ -1,3 +1,4 @@
+"""DEPRECATED: client-side FFT is replaced by `threads/audio_thread.AudioThread` for the realtime protocol; server now runs the FFT pipeline."""
 from PySide6.QtCore import QThread, Signal
 import numpy as np
 from modules.fft.stream_analyzer import Stream_Analyzer
