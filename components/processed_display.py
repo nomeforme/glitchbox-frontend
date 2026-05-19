@@ -1,0 +1,518 @@
+from PySide6.QtWidgets import QLabel, QWidget, QVBoxLayout, QPushButton, QHBoxLayout
+from PySide6.QtCore import Qt, Signal, QThread
+from PySide6.QtGui import QImage, QPixmap
+import numpy as np
+import cv2
+import requests
+import threading
+import sys
+import os
+import zmq
+import time
+from dotenv import load_dotenv
+
+# Add the parent directory to the path to allow importing from the parent package
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_SCALE
+from .fullscreen_window import FullscreenWindow
+from .projection_mapper import ProjectionMapperWindow
+
+# Load environment variables
+load_dotenv(override=True)
+
+# Server configuration
+DEFAULT_SERVER_HOST = os.getenv("DEFAULT_SERVER_HOST")
+DEFAULT_SERVER_ZMQ_PORT = os.getenv("DEFAULT_SERVER_ZMQ_PORT")
+
+print(f"DEFAULT_SERVER_HOST: {DEFAULT_SERVER_HOST}")
+print(f"DEFAULT_SERVER_ZMQ_PORT: {DEFAULT_SERVER_ZMQ_PORT}")
+
+class StreamThread(QThread):
+    """Thread for handling MJPEG stream from server"""
+    frame_received = Signal(np.ndarray)
+    
+    def __init__(self, stream_url):
+        super().__init__()
+        self.stream_url = stream_url
+        self.running = False
+
+    def run(self):
+        """Process the MJPEG stream"""
+        try:
+            response = requests.get(self.stream_url, stream=True)
+            bytes_buffer = bytes()
+            self.running = True
+            
+            while self.running:
+                chunk = response.raw.read(1024)
+                if not chunk:
+                    break
+                    
+                bytes_buffer += chunk
+                a = bytes_buffer.find(b'\xff\xd8')  # JPEG start
+                b = bytes_buffer.find(b'\xff\xd9')  # JPEG end
+                
+                if a != -1 and b != -1:
+                    jpg = bytes_buffer[a:b+2]
+                    bytes_buffer = bytes_buffer[b+2:]
+                    
+                    # Decode JPEG to numpy array
+                    frame = cv2.imdecode(
+                        np.frombuffer(jpg, dtype=np.uint8),
+                        cv2.IMREAD_COLOR
+                    )
+                    
+                    if frame is not None:
+                        # Convert BGR to RGB
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        self.frame_received.emit(frame_rgb)
+                        
+        except Exception as e:
+            print(f"[Stream] Error processing stream: {e}")
+        finally:
+            self.running = False
+
+    def stop(self):
+        """Stop the stream thread"""
+        self.running = False
+        # Try to wait briefly for graceful shutdown
+        if self.wait(200):  # Wait up to 200ms
+            print("[Stream] Thread stopped gracefully")
+        else:
+            print("[Stream] Thread didn't stop gracefully")
+
+class ZMQThread(QThread):
+    """Thread for handling ZMQ image stream"""
+    frame_received = Signal(np.ndarray)
+    
+    def __init__(self):
+        super().__init__()
+        self.running = False
+        print("[ZMQ] Initializing ZMQ context and socket...")
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.SUB)
+        zmq_address = f"tcp://{DEFAULT_SERVER_HOST}:{DEFAULT_SERVER_ZMQ_PORT}"
+        print(f"[ZMQ] Attempting to connect to {zmq_address}...")
+        try:
+            self.socket.connect(zmq_address)
+            self.socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all messages
+            # Set socket options to prevent blocking
+            self.socket.setsockopt(zmq.RCVTIMEO, 1000)  # 1 second receive timeout
+            self.socket.setsockopt(zmq.LINGER, 0)  # Don't wait for pending messages on close
+            print("[ZMQ] Socket connected and subscribed")
+        except Exception as e:
+            print(f"[ZMQ] Failed to connect to ZMQ socket: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def run(self):
+        """Process the ZMQ stream"""
+        try:
+            print("[ZMQ] Starting ZMQ stream processing...")
+            self.running = True
+
+            while self.running:
+                try:
+                    # Receive bytes with timeout (using socket timeout set above)
+                    data = self.socket.recv()
+                    if not data:
+                        continue
+
+                    # Check if data is JPEG encoded (starts with FFD8)
+                    is_jpeg = len(data) >= 2 and data[0] == 0xFF and data[1] == 0xD8
+
+                    if is_jpeg:
+                        # Decode JPEG
+                        frame = cv2.imdecode(
+                            np.frombuffer(data, dtype=np.uint8),
+                            cv2.IMREAD_COLOR
+                        )
+                        if frame is not None:
+                            # Convert BGR to RGB
+                            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        else:
+                            print("[ZMQ] Failed to decode JPEG frame")
+                            continue
+                    else:
+                        # Raw bytes (original behavior)
+                        frame = np.frombuffer(data, dtype=np.uint8)
+
+                        # Calculate expected size based on display dimensions and upscaling
+                        expected_size = int(DISPLAY_HEIGHT * DISPLAY_WIDTH * 3 * (DISPLAY_SCALE ** 2))
+                        if len(frame) != expected_size:
+                            print(f"[ZMQ] Warning: Received data size {len(frame)} doesn't match expected size {expected_size}")
+                            continue
+
+                        # Reshape to image dimensions accounting for upscaling
+                        frame = frame.reshape(int(DISPLAY_HEIGHT * DISPLAY_SCALE), int(DISPLAY_WIDTH * DISPLAY_SCALE), 3)
+
+                    if frame is not None:
+                        self.frame_received.emit(frame)
+                    else:
+                        print("[ZMQ] Failed to process frame")
+                        
+                except zmq.error.Again:
+                    print("[ZMQ] ZMQ timeout - no data received")
+                    continue
+                except zmq.error.ZMQError as e:
+                    if not self.running:
+                        print("[ZMQ] ZMQ error during shutdown (expected)")
+                        break
+                    print(f"[ZMQ] ZMQ error: {e}")
+                    continue
+                except Exception as e:
+                    if not self.running:
+                        print("[ZMQ] Exception during shutdown (expected)")
+                        break
+                    print(f"[ZMQ] Error processing frame: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+                        
+        except Exception as e:
+            print(f"[ZMQ] Error in ZMQ thread: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            print("[ZMQ] Cleaning up ZMQ resources...")
+            self.running = False
+            try:
+                # Close socket first with timeout
+                if hasattr(self, 'socket') and self.socket:
+                    self.socket.setsockopt(zmq.LINGER, 0)  # Don't wait for pending messages
+                    self.socket.close()
+                
+                # Terminate context with timeout
+                if hasattr(self, 'context') and self.context:
+                    self.context.term()
+                print("[ZMQ] ZMQ resources cleaned up successfully")
+            except Exception as e:
+                print(f"[ZMQ] Error during cleanup (non-critical): {e}")
+            finally:
+                self.socket = None
+                self.context = None
+
+    def stop(self):
+        """Stop the ZMQ thread"""
+        print("[ZMQ] Stopping ZMQ thread...")
+        self.running = False
+        
+        # Try to wait briefly for graceful shutdown
+        if self.wait(200):  # Wait up to 200ms
+            print("[ZMQ] Thread stopped gracefully")
+        else:
+            print("[ZMQ] Thread didn't stop gracefully, will be terminated externally")
+
+class ProcessedDisplay(QWidget):
+    """Widget to display processed image output"""
+    
+    def __init__(self, min_size=(640, 360)):
+        super().__init__()
+        self.layout = QVBoxLayout()
+        self.setLayout(self.layout)
+        
+        # Image display
+        self.image_label = QLabel()
+        self.image_label.setMinimumSize(*min_size)
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.layout.addWidget(self.image_label)
+        
+        # Projection Mapper button
+        self.button_layout = QHBoxLayout()
+        self.fullscreen_button = QPushButton("Projection Mapper")
+        self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
+        self.fullscreen_button.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(0, 0, 0, 50%);
+                color: white;
+                border: none;
+                padding: 5px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: rgba(0, 0, 0, 70%);
+            }
+        """)
+        self.button_layout.addStretch()
+        self.button_layout.addWidget(self.fullscreen_button)
+        self.layout.addLayout(self.button_layout)
+        
+        # Stream handling
+        self.stream_thread = None
+        self.zmq_thread = None
+        
+        # Projection mapper window
+        self.projection_mapper = None
+        self.is_fullscreen = False
+        
+        # Black frame mode
+        self.black_frame_mode = False
+
+        # Mirror mode
+        self.mirrored = False
+        self.is_mirrored = False
+        
+    def toggle_fullscreen(self):
+        """Toggle projection mapper window"""
+        if not self.is_fullscreen:
+            if not self.projection_mapper:
+                self.projection_mapper = ProjectionMapperWindow()
+                # Connect close signal to update button state
+                self.projection_mapper.window_closed.connect(self.on_projection_mapper_closed)
+
+            self.projection_mapper.show()
+            # Don't go fullscreen immediately - user will do that from the mapper window
+            self.is_fullscreen = True
+            self.fullscreen_button.setText("Close Projection Mapper")
+        else:
+            if self.projection_mapper:
+                self.projection_mapper.close()
+                self.projection_mapper = None
+            self.is_fullscreen = False
+            self.fullscreen_button.setText("Projection Mapper")
+
+    def on_projection_mapper_closed(self):
+        """Handle projection mapper being closed via X button"""
+        self.projection_mapper = None
+        self.is_fullscreen = False
+        self.fullscreen_button.setText("Projection Mapper")
+
+    def start_stream(self, user_id: str, server_uri: str = "http://localhost:7860"):
+        """Start receiving the image stream
+        
+        Args:
+            user_id: The user ID for the stream
+            server_uri: The server URI (default: http://localhost:7860)
+        """
+        if self.stream_thread and self.stream_thread.running:
+            self.stop_stream()
+            
+        # Create and start ZMQ thread
+        print("[ZMQ] Starting ZMQ stream")
+        self.zmq_thread = ZMQThread()
+        self.zmq_thread.frame_received.connect(self.update_frame)
+        self.zmq_thread.start()
+        
+        # NOTE: Required for ZMQ to start
+        stream_url = f"{server_uri}/api/stream/{user_id}"
+        print(f"[Stream] Starting WebSocket stream from: {stream_url}")
+        self.stream_thread = StreamThread(stream_url)
+        self.stream_thread.frame_received.connect(self.update_frame)
+        self.stream_thread.start()
+
+    def stop_stream(self):
+        """Stop the stream threads"""
+        print("[Display] Stopping stream threads...")
+        if self.stream_thread:
+            print("[Display] Stopping stream thread...")
+            self.stream_thread.stop()
+            # Use QTimer to wait for thread to finish without blocking UI
+            self._wait_for_stream_cleanup()
+            
+        if self.zmq_thread:
+            print("[Display] Stopping ZMQ thread...")
+            self.zmq_thread.stop()
+            # Use QTimer to wait for thread to finish without blocking UI
+            self._wait_for_zmq_cleanup()
+
+    def _wait_for_zmq_cleanup(self):
+        """Wait for ZMQ thread to finish without blocking UI"""
+        if self.zmq_thread is None:
+            return
+            
+        # Check if thread has finished
+        if self.zmq_thread.isFinished():
+            print("[Display] ZMQ thread finished gracefully")
+            self.zmq_thread = None
+            return
+        
+        # If thread is still running, try to terminate it gracefully
+        if self.zmq_thread.isRunning():
+            print("[Display] ZMQ thread still running, attempting graceful termination...")
+            from PySide6.QtCore import QTimer
+            
+            # Try to wait a bit more, then force terminate if needed
+            def check_and_terminate():
+                if self.zmq_thread and self.zmq_thread.isRunning():
+                    print("[Display] Force terminating ZMQ thread...")
+                    self.zmq_thread.terminate()
+                    # Give termination a moment to complete
+                    QTimer.singleShot(100, lambda: setattr(self, 'zmq_thread', None))
+                else:
+                    print("[Display] ZMQ thread stopped gracefully")
+                    self.zmq_thread = None
+            
+            QTimer.singleShot(500, check_and_terminate)  # Wait 500ms then check
+        else:
+            self.zmq_thread = None
+            print("[Display] ZMQ thread cleanup completed")
+
+    def _wait_for_stream_cleanup(self):
+        """Wait for stream thread to finish without blocking UI"""
+        if self.stream_thread is None:
+            return
+            
+        # Check if thread has finished
+        if self.stream_thread.isFinished():
+            print("[Display] Stream thread finished gracefully")
+            self.stream_thread = None
+            return
+        
+        # If thread is still running, try to terminate it gracefully
+        if self.stream_thread.isRunning():
+            print("[Display] Stream thread still running, attempting graceful termination...")
+            from PySide6.QtCore import QTimer
+            
+            # Try to wait a bit more, then force terminate if needed
+            def check_and_terminate():
+                if self.stream_thread and self.stream_thread.isRunning():
+                    print("[Display] Force terminating stream thread...")
+                    self.stream_thread.terminate()
+                    # Give termination a moment to complete
+                    QTimer.singleShot(100, lambda: setattr(self, 'stream_thread', None))
+                else:
+                    print("[Display] Stream thread stopped gracefully")
+                    self.stream_thread = None
+            
+            QTimer.singleShot(300, check_and_terminate)  # Wait 300ms then check
+        else:
+            self.stream_thread = None
+            print("[Display] Stream thread cleanup completed")
+
+    def update_frame(self, frame: np.ndarray):
+        """Update the display with a new frame"""
+        if frame is None:
+            return
+
+        # If black frame mode is enabled, show black frame instead
+        if self.black_frame_mode:
+            # Calculate image dimensions from config
+            height = int(DISPLAY_HEIGHT * DISPLAY_SCALE)
+            width = int(DISPLAY_WIDTH * DISPLAY_SCALE)
+
+            # Create black frame (RGB)
+            black_frame = np.zeros((height, width, 3), dtype=np.uint8)
+            frame = black_frame
+
+        # Apply mirroring if enabled
+        if self.mirrored:
+            frame = cv2.flip(frame, 1)
+
+        # Only render on the topmost active layer
+        if self.projection_mapper and self.is_fullscreen:
+            # Projection mapper is open - send frame there, don't render locally
+            self.projection_mapper.update_frame(frame)
+        else:
+            # Projection mapper is not open - render in main display
+            height, width = frame.shape[:2]
+            bytes_per_line = 3 * width
+            q_image = QImage(frame.data, width, height, bytes_per_line, QImage.Format_RGB888)
+
+            # Get the available size of the label
+            available_size = self.image_label.size()
+
+            # Scale the pixmap to fit the available space while maintaining aspect ratio
+            pixmap = QPixmap.fromImage(q_image)
+            scaled_pixmap = pixmap.scaled(available_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+            self.image_label.setPixmap(scaled_pixmap)
+
+        # Update FPS counter in status bar
+        main_window = self.window()
+        if main_window:
+            main_window.status_bar.update_fps()
+
+    def clear_display(self):
+        """Clear the display and stop stream"""
+        self.stop_stream()
+        self.image_label.clear()
+        if self.projection_mapper:
+            self.projection_mapper.clear_display()
+
+    def clear_zmq_queue(self):
+        """Clear any pending messages in the ZMQ queue"""
+        if self.zmq_thread and self.zmq_thread.running and hasattr(self.zmq_thread, 'socket') and self.zmq_thread.socket:
+            try:
+                cleared_count = 0
+                # Clear pending messages by receiving all available data without blocking
+                while self.zmq_thread.socket.poll(timeout=0) > 0:  # 0 timeout = non-blocking
+                    self.zmq_thread.socket.recv(zmq.NOBLOCK)
+                    cleared_count += 1
+                    # Prevent infinite loops
+                    if cleared_count > 100:
+                        print(f"[ZMQ] Cleared {cleared_count} messages, stopping to prevent infinite loop")
+                        break
+                if cleared_count > 0:
+                    print(f"[ZMQ] Cleared {cleared_count} pending messages from queue")
+            except zmq.error.Again:
+                # No more messages to clear
+                pass
+            except Exception as e:
+                print(f"[ZMQ] Error clearing queue (non-critical): {e}")
+
+    def display_black_frame(self):
+        """Display a black frame of the expected image size"""
+        try:
+            # Calculate image dimensions from config
+            height = int(DISPLAY_HEIGHT * DISPLAY_SCALE)
+            width = int(DISPLAY_WIDTH * DISPLAY_SCALE)
+            
+            # Create black frame (RGB)
+            black_frame = np.zeros((height, width, 3), dtype=np.uint8)
+            
+            # Display the black frame
+            self.update_frame(black_frame)
+            print(f"[Display] Showing black frame of size {width}x{height}")
+            
+        except Exception as e:
+            print(f"[Display] Error creating black frame: {e}")
+
+    def set_black_frame_mode(self, enabled: bool):
+        """Enable or disable black frame mode"""
+        self.black_frame_mode = enabled
+        if enabled:
+            print("[Display] Black frame mode enabled")
+        else:
+            print("[Display] Black frame mode disabled")
+
+    def cleanup(self):
+        """Clean up all resources"""
+        print("[Display] Starting cleanup...")
+        self.stop_stream()
+        if self.projection_mapper:
+            print("[Display] Closing projection mapper window...")
+            self.projection_mapper.close()
+            self.projection_mapper = None
+        print("[Display] Cleanup completed")
+
+    def set_mirror_mode(self, enabled: bool):
+        """Enable or disable mirror mode"""
+        self.mirrored = enabled
+        self.is_mirrored = enabled
+        if enabled:
+            print("[Display] Mirror mode enabled")
+        else:
+            print("[Display] Mirror mode disabled")
+
+    def toggle_mirror(self):
+        """Toggle mirror mode"""
+        self.set_mirror_mode(not self.mirrored)
+        
+    def __del__(self):
+        """Cleanup on deletion"""
+        try:
+            # Safely stop threads without waiting to prevent core dumps during destruction
+            if hasattr(self, 'stream_thread') and self.stream_thread:
+                self.stream_thread.running = False
+                if self.stream_thread.isRunning():
+                    self.stream_thread.terminate()
+                
+            if hasattr(self, 'zmq_thread') and self.zmq_thread:
+                self.zmq_thread.running = False
+                if self.zmq_thread.isRunning():
+                    self.zmq_thread.terminate()
+
+            if hasattr(self, 'projection_mapper') and self.projection_mapper:
+                self.projection_mapper.close()
+        except Exception as e:
+            print(f"[Display] Error during destruction: {e}")
