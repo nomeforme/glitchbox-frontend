@@ -10,6 +10,11 @@
 #
 # Enable STT (requires an NVIDIA GPU + driver):
 #   GLITCHBOX_STT_ENABLED=1 ./start_client.sh
+#
+# Extra args pass through to main.py, e.g. pick a server preset:
+#   ./start_client.sh --preset journey_cn_depthanything
+#   ./start_client.sh --host 100.x.y.z --port 8001 --preset vanilla_journey
+# (--preset overrides GLITCHBOX_PRESET; default 'vanilla'.)
 
 set -euo pipefail
 
@@ -20,4 +25,4 @@ if [[ "${GLITCHBOX_STT_ENABLED:-0}" == "1" ]]; then
     export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:${CUDNN_LIB_DIR}"
 fi
 
-exec uv run python main.py
+exec uv run python main.py "$@"

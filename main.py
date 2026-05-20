@@ -84,7 +84,7 @@ def detect_microphones() -> List[Tuple[int, str]]:
     return available_mics
 
 class MainWindow(QMainWindow):
-    def __init__(self, server_host, server_port):
+    def __init__(self, server_host, server_port, preset=None):
         super().__init__()
         self.setWindowTitle("Glitch Machine Engine")
         
@@ -93,6 +93,10 @@ class MainWindow(QMainWindow):
         self.server_port = server_port
         self.server_ws_uri = f"ws://{server_host}:{server_port}"
         self.server_http_uri = f"http://{server_host}:{server_port}"
+
+        # Realtime preset resolution: explicit CLI flag (passed here as
+        # `preset`) wins; else GLITCHBOX_PRESET env; else "vanilla".
+        self.preset = preset or os.getenv("GLITCHBOX_PRESET", "vanilla")
 
         # Initialize device indices from config
         self.camera_device_index = CAMERA_DEVICE_INDEX
@@ -495,15 +499,13 @@ class MainWindow(QMainWindow):
         # Build a SessionConfig from server-side defaults (the realtime
         # server's /api/installations/plantoid16/defaults endpoint),
         # construct a WSClient, and wire the per-frame joiner. The
-        # GLITCHBOX_PRESET env var picks which preset to fetch — the
-        # default 'vanilla' is a minimal img2img baseline; 'plantoid16'
-        # is the rich paired-LoRA / audio-reactive / ControlNet-depth
-        # preset (use this once the vanilla baseline produces correct
-        # output and you want the full plantoid 16 experience).
+        # self.preset (set above) picks which server preset to fetch —
+        # resolved from --preset CLI flag > GLITCHBOX_PRESET env >
+        # "vanilla". See server presets in
+        # sdxl-travel-ablation/experiments/manifests/realtime/.
         if REALTIME_V2:
-            preset = os.getenv("GLITCHBOX_PRESET", "vanilla")
             self.session_cfg = self._fetch_session_config(
-                server_host, server_port, preset
+                server_host, server_port, self.preset
             )
             self.ws_client_v2 = WSClient(
                 host=server_host,
@@ -545,7 +547,25 @@ class MainWindow(QMainWindow):
             # camera frame (camera tick is the dispatch trigger so we
             # send at most one packet per rendered frame).
             self._v2_latest_pcm = b""
+            # Glitchbox-faithful gate state. The camera thread emits at
+            # webcam hardware rate (~30 fps) regardless of network /
+            # server speed; the slot pattern decouples that from WS
+            # send rate. Frames pile up into ``_v2_latest_frame``
+            # (overwriting older ones), and the server's per-frame
+            # ``{"type":"send_frame"}`` grant is what actually fires a
+            # ``ws_client_v2.send_frame()`` call.
+            #
+            # Two-state machine:
+            #   * grant arrives, slot empty   → set _v2_grant_held=True
+            #   * grant arrives, slot has frame → ship it, clear slot
+            #   * frame arrives, _v2_grant_held=True → ship now, clear
+            #   * frame arrives, _v2_grant_held=False → just stash in slot
+            self._v2_latest_frame: bytes | None = None
+            self._v2_grant_held = False
             self.camera_thread.frame_ready.connect(self._v2_handle_camera_frame)
+            self.ws_client_v2.send_frame_granted.connect(
+                self._v2_handle_grant
+            )
 
             # Alpha telemetry → status bar (throttled to ~1 Hz so we
             # don't spam the UI at 20-30 fps).
@@ -885,23 +905,93 @@ class MainWindow(QMainWindow):
         self._v2_latest_pcm = pcm_bytes
 
     def _v2_handle_camera_frame(self, frame):
-        """Encode camera frame as JPEG and ship with the most recent PCM.
+        """Stash the latest camera frame (overwriting older ones).
 
-        The camera frame is the dispatch trigger (one packet per frame).
+        Glitchbox-faithful: the camera thread runs at hardware rate
+        (~30 fps) regardless of GPU throughput. We never directly fire
+        ``send_frame()`` here — that would re-introduce the unbounded
+        TCP buffer fill the request-grant gate is designed to prevent.
+        Instead we update a single-slot buffer; the server's per-frame
+        ``send_frame`` grant (see ``_v2_handle_grant``) is what
+        actually ships a frame.
         """
         if not REALTIME_V2:
             return
         if not getattr(self, "ws_client_v2", None) or not self.ws_client_v2.connected:
+            # One-time print so we can see if frames are coming in but
+            # the gate is blocking. After connect this should never
+            # short-circuit.
+            if not getattr(self, "_v2_cam_disconnect_logged", False):
+                print(
+                    f"[V2 GATE] camera_frame arriving but ws not connected — "
+                    f"ws_client_v2={bool(getattr(self, 'ws_client_v2', None))}, "
+                    f"connected={getattr(self.ws_client_v2, 'connected', None) if getattr(self, 'ws_client_v2', None) else 'n/a'}"
+                )
+                self._v2_cam_disconnect_logged = True
             return
+        if not getattr(self, "_v2_first_cam_frame_logged", False):
+            print(
+                f"[V2 GATE] first camera frame received post-connect; "
+                f"_v2_grant_held={self._v2_grant_held}"
+            )
+            self._v2_first_cam_frame_logged = True
         try:
             # camera_thread emits RGB; encode as JPEG (BGR for cv2).
             bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             ok, buf = cv2.imencode(".jpg", bgr)
             if not ok:
                 return
-            self.ws_client_v2.send_frame(buf.tobytes(), self._v2_latest_pcm)
+            jpeg = buf.tobytes()
+            if self._v2_grant_held:
+                # Server already granted but we had no frame to send.
+                # Ship this one immediately and consume the grant.
+                self._v2_grant_held = False
+                self._v2_latest_frame = None
+                self.ws_client_v2.send_frame(jpeg, self._v2_latest_pcm)
+                if not getattr(self, "_v2_first_send_logged", False):
+                    print("[V2 GATE] first frame shipped via held grant")
+                    self._v2_first_send_logged = True
+            else:
+                # No grant outstanding — overwrite the slot. Older
+                # unsent frames are dropped on the floor (intentional;
+                # glitchbox's ``wsClient.current_frame = frame`` does
+                # the same).
+                self._v2_latest_frame = jpeg
         except Exception as e:
             print(f"[V2] send_frame error: {e}")
+
+    def _v2_handle_grant(self):
+        """Server granted the next frame. Ship the slot, or hold the grant.
+
+        Equivalent of the legacy client's
+        ``websocket_client.py:256-259`` handler that reacted to
+        ``{"status":"send_frame"}`` by calling ``send_frame()``.
+        """
+        if not REALTIME_V2:
+            return
+        if not getattr(self, "ws_client_v2", None) or not self.ws_client_v2.connected:
+            return
+        # Track grant arrivals so we can see if the recv loop is reading
+        # them. Count rather than print-per-grant to avoid log spam at
+        # GPU throughput.
+        self._v2_grant_count = getattr(self, "_v2_grant_count", 0) + 1
+        if self._v2_grant_count in (1, 5, 20, 100):
+            print(
+                f"[V2 GATE] grant #{self._v2_grant_count} "
+                f"(latest_frame={'set' if self._v2_latest_frame else 'None'})"
+            )
+        if self._v2_latest_frame is not None:
+            jpeg = self._v2_latest_frame
+            self._v2_latest_frame = None
+            self._v2_grant_held = False
+            try:
+                self.ws_client_v2.send_frame(jpeg, self._v2_latest_pcm)
+            except Exception as e:
+                print(f"[V2] send_frame (grant) error: {e}")
+        else:
+            # No frame in slot yet — the next ``_v2_handle_camera_frame``
+            # will ship immediately and consume this grant.
+            self._v2_grant_held = True
 
     def _v2_on_capabilities(self, caps):
         """V2 handshake-complete handler — kicks the ZMQ subscriber so
@@ -917,6 +1007,13 @@ class MainWindow(QMainWindow):
             f"V2 connected: {self.server_host}:{self.server_port}"
         )
         self.reconnection_count = 0
+        # Fresh-connection reset of the request/grant slot. Any stale
+        # grant held over from a prior session would have caused the
+        # first camera frame to ship without a grant from the new
+        # session; clearing both halves of the slot keeps the gate
+        # honest after each handshake.
+        self._v2_latest_frame = None
+        self._v2_grant_held = False
         # Kick ProcessedDisplay's ZMQ subscriber. The legacy StreamThread
         # spawned alongside will harmlessly 404 against the realtime
         # server's nonexistent /api/stream/{user_id} endpoint; only the
@@ -2377,13 +2474,26 @@ def main():
     parser = argparse.ArgumentParser(description='Glitch Machine Engine Client')
     parser.add_argument('--host', default=DEFAULT_SERVER_HOST, help=f'Server hostname (default: {DEFAULT_SERVER_HOST})')
     parser.add_argument('--port', type=int, default=DEFAULT_SERVER_PORT, help=f'Server port (default: {DEFAULT_SERVER_PORT})')
+    parser.add_argument(
+        '--preset',
+        default=None,
+        help=(
+            "Realtime server preset to fetch (e.g. vanilla, vanilla_journey, "
+            "journey_cn_dpt, journey_cn_depthanything, plantoid16). "
+            "Overrides the GLITCHBOX_PRESET env var; defaults to 'vanilla'."
+        ),
+    )
     args = parser.parse_args()
-    
+
     # Print server configuration
     print(f"Connecting to server at {args.host}:{args.port}")
-    
+    if args.preset:
+        print(f"Preset (CLI): {args.preset}")
+
     app = QApplication(sys.argv)
-    window = MainWindow(server_host=args.host, server_port=args.port)
+    window = MainWindow(
+        server_host=args.host, server_port=args.port, preset=args.preset
+    )
     window.setGeometry(100, 100, 1280, 720)
     window.show()
     sys.exit(app.exec())

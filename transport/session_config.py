@@ -75,6 +75,7 @@ class SessionConfig:
     mode: str = "img2img"
     controlnet: str = "none"
     cn_scale: float = 0.0               # only meaningful when controlnet != "none"
+    depth_model: str = "dpt-hybrid"     # CN depth backend (see core.depth)
 
     # ----- Diffusion knobs -----
     strength: float = 0.7
@@ -84,6 +85,19 @@ class SessionConfig:
     prompt_travel: str = "slerp"
     noise_travel: str = "none"
     init_encode_once: bool = False      # forced false by init_video path
+
+    # ----- Synthetic α ramp (method Q) -----
+    # Drives the blend α from a deterministic frame-index function instead
+    # of audio. None = off. Modes: linear / linear_pingpong / cosine.
+    # Periodic in realtime — one cycle per (2×) ramp_period_seconds.
+    lora_blend_ramp_mode: Optional[str] = None
+    ramp_period_seconds: float = 8.0
+    # Walk the full interleaved A/B prompt list (looping) instead of
+    # 2-endpoint A↔B travel. Realtime journey loop (method C).
+    prompt_journey_loop: bool = False
+
+    # ----- Tiny VAE (TAESD-XL) — realtime perf -----
+    use_tiny_vae: bool = True
 
     # ----- Pixel feedback path -----
     feedback_strength: float = 0.4

@@ -64,6 +64,13 @@ class WSClient(QThread):
     connection_error = Signal(str)
     status_changed = Signal(str)
     error_message = Signal(str)                 # server-pushed {"type":"error"}
+    # Per-frame "you may send the next frame" grant from the server.
+    # Glitchbox-faithful — equivalent of the legacy
+    # ``{"status":"send_frame"}`` text message in the old protocol. The
+    # UI thread holds the most-recent camera frame in a single slot and
+    # ships it only when this signal fires, pinning in-flight client→
+    # server frames at ≤ 1 (matches glitchbox's per-user queue depth).
+    send_frame_granted = Signal()
 
     def __init__(
         self,
@@ -250,6 +257,20 @@ class WSClient(QThread):
                         float(data.get("w_a", 0.0)),
                         float(data.get("w_b", 0.0)),
                     )
+                elif t == "send_frame":
+                    # Server gating us to ship the next frame. The UI
+                    # thread holds the most recent camera frame in a
+                    # single-slot buffer; this signal fires the actual
+                    # ``send_frame()`` call from the Qt main thread.
+                    self._grant_recv_count = (
+                        getattr(self, "_grant_recv_count", 0) + 1
+                    )
+                    if self._grant_recv_count in (1, 5, 20, 100):
+                        print(
+                            f"[WSClient] grant #{self._grant_recv_count} "
+                            "received from server"
+                        )
+                    self.send_frame_granted.emit()
                 elif t == "error":
                     self.error_message.emit(str(data.get("message", "unknown")))
                 # Unknown types are silently ignored — forward-compatible.
