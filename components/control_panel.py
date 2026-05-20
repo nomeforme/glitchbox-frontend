@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                              QSlider, QCheckBox, QLabel, QLineEdit,
-                             QScrollArea, QFrame)
+                             QScrollArea, QFrame, QComboBox)
 from PySide6.QtCore import Qt, Signal
 
 # Minimum heights for controls
@@ -71,6 +71,8 @@ class ControlPanel(QWidget):
                 self.add_checkbox(param_id, param, default_value)
             elif field_type == 'textarea':
                 self.add_text_input(param_id, param, default_value)
+            elif field_type == 'select':
+                self.add_select(param_id, param, default_value)
 
         # Add stretch at the end so controls stay at top
         self.main_layout.addStretch()
@@ -145,6 +147,35 @@ class ControlPanel(QWidget):
 
         self.main_layout.addWidget(container)
         self.controls[param_id] = checkbox
+
+    def add_select(self, param_id, param, default_value=None):
+        """Add a dropdown (combo) control for an enumerated parameter."""
+        container = QWidget()
+        container.setMinimumHeight(SLIDER_MIN_HEIGHT)
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 4, 0, 4)
+
+        label = QLabel(param.get('title', param_id))
+        label.setMinimumWidth(150)
+        layout.addWidget(label)
+
+        combo = QComboBox()
+        options = [str(o) for o in param.get('options', [])]
+        combo.addItems(options)
+        current = default_value if default_value is not None else param.get('default')
+        if current is not None and str(current) in options:
+            combo.setCurrentText(str(current))
+
+        # Legacy path (parameter_changed). The live-knob path is wired by
+        # apply_capabilities → _wire_live_knob for V2.
+        combo.currentTextChanged.connect(
+            lambda text, pid=param_id: self.parameter_changed.emit(pid, text))
+
+        layout.addWidget(combo)
+        layout.addStretch()
+
+        self.main_layout.addWidget(container)
+        self.controls[param_id] = combo
 
     def add_text_input(self, param_id, param, default_value=None):
         """Add a text input control"""
@@ -240,6 +271,10 @@ class ControlPanel(QWidget):
             control.stateChanged.connect(
                 lambda v, pid=param_id: self.knob_changed.emit(pid, bool(v))
             )
+        elif isinstance(control, QComboBox):
+            control.currentTextChanged.connect(
+                lambda text, pid=param_id: self.knob_changed.emit(pid, text)
+            )
         elif isinstance(control, QLineEdit):
             control.textChanged.connect(
                 lambda v, pid=param_id: self.knob_changed.emit(pid, v)
@@ -257,5 +292,7 @@ class ControlPanel(QWidget):
             value_edit.setText(f"{value:.2f}")
         elif isinstance(control, QCheckBox):
             control.setChecked(value)
+        elif isinstance(control, QComboBox):
+            control.setCurrentText(str(value))
         elif isinstance(control, QLineEdit):
             control.setText(str(value))

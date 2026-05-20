@@ -521,8 +521,11 @@ class MainWindow(QMainWindow):
                 sample_rate=CLIENT_SAMPLE_RATE,
                 fps=CLIENT_FPS,
             )
+            # Render the server-advertised knob schema, THEN classify
+            # (enable live / grey-out frozen). _v2_build_controls runs
+            # first so apply_capabilities has controls to operate on.
             self.ws_client_v2.capabilities_received.connect(
-                self.control_panel.apply_capabilities
+                self._v2_build_controls
             )
             # V2 handshake-complete also triggers ProcessedDisplay's ZMQ
             # subscriber. Without this, the server emits rendered frames
@@ -884,6 +887,23 @@ class MainWindow(QMainWindow):
         self.camera_display.update_frame(frame)
 
     # --- Realtime V2 helpers --------------------------------------------
+    def _v2_build_controls(self, caps: dict):
+        """Render the server's knob schema, then classify live/frozen.
+
+        The server advertises the realtime-adjustable knobs (id, type,
+        range, current value) in ``caps['controls']`` — same shape the
+        legacy /api/settings InputParams used. We render them generically
+        (the client never learns what a knob means) and then let
+        apply_capabilities enable the live ones + wire knob_changed →
+        ws_client_v2.update_knob → server.update(field, value).
+        """
+        controls = caps.get("controls", {})
+        if controls:
+            self.control_panel.setup_pipeline_options(
+                {"input_params": {"properties": controls}}
+            )
+        self.control_panel.apply_capabilities(caps)
+
     def _v2_handle_pcm_chunk(self, pcm_bytes: bytes):
         """Stash the most recent PCM chunk for the next camera frame."""
         self._v2_latest_pcm = pcm_bytes
