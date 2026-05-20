@@ -21,7 +21,7 @@ from components import StatusBar
 from components.video_display import VideoDisplay
 from clients import WebSocketClient
 from threads import CameraThread, SpeechToTextThread, FFTAnalyzerThread, VideoThread, VideoAudioThread
-from config import MIC_DEVICE_INDEX, AUTO_DISABLE_BLACK_FRAME_AFTER_CURATION_UPDATE, BLACK_FRAME_DISABLE_TIMEOUT, FORCE_MANUAL_RECONNECTION_AFTER_CURATION_UPDATE, CAMERA_DEVICE_INDEX, CURATION_INDEX_AUTO_UPDATE, CURATION_INDEX_UPDATE_TIME, CURATION_INDEX_MAX, MAX_CAMERA_INDEX, STT_ENABLED
+from config import MIC_DEVICE_INDEX, AUTO_DISABLE_BLACK_FRAME_AFTER_CURATION_UPDATE, BLACK_FRAME_DISABLE_TIMEOUT, FORCE_MANUAL_RECONNECTION_AFTER_CURATION_UPDATE, CAMERA_DEVICE_INDEX, CURATION_INDEX_AUTO_UPDATE, CURATION_INDEX_UPDATE_TIME, CURATION_INDEX_MAX, MAX_CAMERA_INDEX, STT_ENABLED, CLIENT_SAMPLE_RATE, CLIENT_FPS
 from utils.list_cameras import test_camera, get_device_info
 
 # --- Realtime protocol (V2) integration ---------------------------------
@@ -30,7 +30,7 @@ from utils.list_cameras import test_camera, get_device_info
 # above). Default is V2 (1).
 REALTIME_V2 = os.getenv("GLITCHBOX_REALTIME_V2", "1") == "1"
 if REALTIME_V2:
-    from transport import SessionConfig, WSClient
+    from transport import WSClient
     from threads.audio_thread import AudioThread
 # ------------------------------------------------------------------------
 
@@ -94,9 +94,13 @@ class MainWindow(QMainWindow):
         self.server_ws_uri = f"ws://{server_host}:{server_port}"
         self.server_http_uri = f"http://{server_host}:{server_port}"
 
-        # Realtime preset resolution: explicit CLI flag (passed here as
-        # `preset`) wins; else GLITCHBOX_PRESET env; else "vanilla".
-        self.preset = preset or os.getenv("GLITCHBOX_PRESET", "vanilla")
+        # Realtime preset request: explicit CLI flag (passed here as
+        # `preset`) wins, else GLITCHBOX_PRESET env, else None. None means
+        # "let the server decide" — the server owns the render config and
+        # applies its own configured default preset. The client never needs
+        # to know what presets exist; it only forwards a name if the
+        # operator explicitly asked for one.
+        self.preset = preset or os.getenv("GLITCHBOX_PRESET") or None
 
         # Initialize device indices from config
         self.camera_device_index = CAMERA_DEVICE_INDEX
@@ -499,21 +503,24 @@ class MainWindow(QMainWindow):
         # Build a SessionConfig from server-side defaults (the realtime
         # server's /api/installations/plantoid16/defaults endpoint),
         # construct a WSClient, and wire the per-frame joiner. The
-        # self.preset (set above) picks which server preset to fetch —
-        # resolved from --preset CLI flag > GLITCHBOX_PRESET env >
-        # "vanilla". See server presets in
-        # sdxl-travel-ablation/experiments/manifests/realtime/.
+        # The client is a dumb AV terminal: it forwards an OPTIONAL preset
+        # name + its own capture params (sample_rate, fps), and displays
+        # whatever frames the server renders. It holds NO render config
+        # (LoRA / ControlNet / dimensions / prompts all live server-side).
+        # This is what lets the client run on a machine with zero knowledge
+        # of the server's setup.
         if REALTIME_V2:
-            self.session_cfg = self._fetch_session_config(
-                server_host, server_port, self.preset
-            )
             self.ws_client_v2 = WSClient(
                 host=server_host,
                 port=int(server_port),
                 max_retries=10,
                 initial_retry_delay=1.0,
             )
-            self.ws_client_v2.configure(self.session_cfg)
+            self.ws_client_v2.configure(
+                preset=self.preset,
+                sample_rate=CLIENT_SAMPLE_RATE,
+                fps=CLIENT_FPS,
+            )
             self.ws_client_v2.capabilities_received.connect(
                 self.control_panel.apply_capabilities
             )
@@ -532,13 +539,14 @@ class MainWindow(QMainWindow):
             # Live-knob updates flow control_panel → ws_client_v2.update_knob
             self.control_panel.knob_changed.connect(self.ws_client_v2.update_knob)
 
-            # Audio thread (raw PCM, no client-side FFT). Sample rate
-            # MUST match SessionConfig.sample_rate — the server
-            # constructs RealtimeFFTAudioAnalyzer with the same value
-            # from the handshake. Drift → silent garbage-FFT.
+            # Audio thread (raw PCM, no client-side FFT). The client OWNS
+            # its mic rate (CLIENT_SAMPLE_RATE) and ships it to the server
+            # in the handshake (client_av.sample_rate) — the server builds
+            # RealtimeFFTAudioAnalyzer with that exact value, so they can't
+            # drift.
             self.audio_thread = AudioThread(
                 input_device_index=self.audio_device_index,
-                sample_rate=self.session_cfg.sample_rate,
+                sample_rate=CLIENT_SAMPLE_RATE,
                 chunk_ms=50,
             )
             self.audio_thread.pcm_chunk_ready.connect(self._v2_handle_pcm_chunk)
@@ -876,30 +884,6 @@ class MainWindow(QMainWindow):
         self.camera_display.update_frame(frame)
 
     # --- Realtime V2 helpers --------------------------------------------
-    def _fetch_session_config(self, host: str, port, preset: str) -> SessionConfig:
-        """GET /api/installations/plantoid16/defaults?preset=... and
-        hydrate a SessionConfig from the response. Falls back to the
-        dataclass defaults if the server is unreachable so the UI still
-        launches and the user can manually retry the Connect step.
-        """
-        import requests
-        url = f"http://{host}:{port}/api/installations/plantoid16/defaults"
-        print(f"[V2] Fetching session config from {url}?preset={preset}")
-        try:
-            r = requests.get(url, params={"preset": preset}, timeout=5)
-            r.raise_for_status()
-            cfg = SessionConfig.from_dict(r.json())
-            print(f"[V2] Loaded '{preset}' preset: "
-                  f"{cfg.width}×{cfg.height}, lora={cfg.lora!r}, "
-                  f"controlnet={cfg.controlnet}, "
-                  f"feedback_strength={cfg.feedback_strength}, "
-                  f"latent_carryover={cfg.latent_carryover}")
-            return cfg
-        except Exception as exc:
-            print(f"[V2] /defaults fetch failed ({exc}); using "
-                  f"dataclass defaults")
-            return SessionConfig()
-
     def _v2_handle_pcm_chunk(self, pcm_bytes: bytes):
         """Stash the most recent PCM chunk for the next camera frame."""
         self._v2_latest_pcm = pcm_bytes
@@ -2478,9 +2462,11 @@ def main():
         '--preset',
         default=None,
         help=(
-            "Realtime server preset to fetch (e.g. vanilla, vanilla_journey, "
-            "journey_cn_dpt, journey_cn_depthanything, plantoid16). "
-            "Overrides the GLITCHBOX_PRESET env var; defaults to 'vanilla'."
+            "OPTIONAL realtime preset name to request from the server "
+            "(e.g. vanilla, vanilla_journey, journey_lora_fused, "
+            "journey_cn_depthanything, plantoid16). Overrides GLITCHBOX_PRESET. "
+            "If unset, the server applies its own configured default — the "
+            "client needs no knowledge of available presets."
         ),
     )
     args = parser.parse_args()

@@ -29,8 +29,6 @@ from PySide6.QtCore import QThread, Signal
 
 import websockets
 
-from .session_config import SessionConfig
-
 IS_WINDOWS = os.name == "nt"
 
 if not IS_WINDOWS:
@@ -86,7 +84,11 @@ class WSClient(QThread):
         self.ws_path = ws_path
         self.uri = f"ws://{host}:{port}{ws_path}"
 
-        self.session_cfg: Optional[SessionConfig] = None
+        # The client holds NO render config. It forwards an optional preset
+        # NAME (or None → server default) and its own capture params.
+        self.preset: Optional[str] = None
+        self.sample_rate: int = 44100
+        self.fps: int = 20
         self.websocket = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.running = False
@@ -102,12 +104,21 @@ class WSClient(QThread):
     # Public API (callable from any thread)
     # ------------------------------------------------------------------
 
-    def configure(self, session_cfg: SessionConfig) -> None:
-        """Set the SessionConfig to send on next connect.
+    def configure(
+        self,
+        preset: Optional[str] = None,
+        sample_rate: int = 44100,
+        fps: int = 20,
+    ) -> None:
+        """Set the handshake parameters to send on next connect.
 
-        Must be called before `start()` or before `reconnect()`.
+        ``preset`` is an OPTIONAL server preset name (None → the server
+        applies its own configured default). ``sample_rate`` / ``fps`` are
+        this client's capture params. Must be called before `start()`.
         """
-        self.session_cfg = session_cfg
+        self.preset = preset
+        self.sample_rate = int(sample_rate)
+        self.fps = int(fps)
 
     def send_frame(self, image_jpeg_bytes: bytes, pcm_bytes: bytes) -> None:
         """Send one camera frame + audio chunk as a single binary message.
@@ -173,17 +184,25 @@ class WSClient(QThread):
             print(f"[WSClient] send_frame failed: {e}")
 
     async def _handshake(self) -> bool:
-        """Send session_config + await session_ready."""
-        if self.session_cfg is None:
-            self.connection_error.emit(
-                "WSClient.configure(session_cfg) was not called before connect"
-            )
-            return False
+        """Send the minimal session_config + await session_ready.
+
+        Sends an optional preset name + this client's capture params. The
+        server owns all render config; we send NO LoRA / ControlNet /
+        dimension state.
+        """
         try:
             handshake = {
                 "type": "session_config",
-                "config": self.session_cfg.to_dict(),
+                "preset": self.preset,   # None → server default
+                "client_av": {
+                    "sample_rate": self.sample_rate,
+                    "fps": self.fps,
+                },
             }
+            print(
+                f"[WSClient] handshake: preset={self.preset!r} "
+                f"sample_rate={self.sample_rate} fps={self.fps}"
+            )
             await self.websocket.send(json.dumps(handshake))
             msg = await self.websocket.recv()
             data = json.loads(msg)

@@ -10,6 +10,12 @@ DISPLAY_HEIGHT = 768
 DISPLAY_SCALE = 1.0
 CAMERA_DEVICE_INDEX = 0 #0 #42
 MIC_DEVICE_INDEX = 0 #16
+
+# Client-owned AV capture params (sent to the realtime server in the
+# handshake — these are facts about THIS machine's mic/camera, not server
+# render config). The server's audio chain must match the actual mic rate.
+CLIENT_SAMPLE_RATE = 44100
+CLIENT_FPS = 20
 MAX_CAMERA_INDEX = 50  # Maximum camera index to check (supports virtual cameras like /dev/video42)
 
 # Speech-to-text settings
