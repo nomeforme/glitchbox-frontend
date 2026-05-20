@@ -16,9 +16,9 @@ class ControlPanel(QWidget):
     # server marked `live_adjustable` in its session_ready capabilities.
     # `main.py` wires this to `WSClient.update_knob`.
     knob_changed = Signal(str, object)       # (field, value)
-    # LoRA hot-swap request: (slug_a, slug_b). Emitted on the Load button;
-    # main.py wires it to WSClient.swap_lora.
-    lora_swap_requested = Signal(str, str)
+    # LoRA hot-swap request: (slug_a, slug_b, weight_a, weight_b). Emitted
+    # on the Load button; main.py wires it to WSClient.swap_lora.
+    lora_swap_requested = Signal(str, str, float, float)
 
     def __init__(self):
         super().__init__()
@@ -216,6 +216,14 @@ class ControlPanel(QWidget):
         if db in options:
             combo_b.setCurrentText(db)
 
+        # Per-LoRA fuse weights (editable; default 0.5). Applied at fuse
+        # time in fused mode (ignored in dynamic-blend mode, which is
+        # α-driven per frame).
+        dwa = str(param.get('default_weight_a', 0.5))
+        dwb = str(param.get('default_weight_b', 0.5))
+        weight_a = QLineEdit(dwa); weight_a.setFixedWidth(44)
+        weight_b = QLineEdit(dwb); weight_b.setFixedWidth(44)
+
         def _on_curation(idx_text):
             pair = presets.get(idx_text)
             if pair and len(pair) == 2:
@@ -225,20 +233,31 @@ class ControlPanel(QWidget):
                     combo_b.setCurrentText(str(pair[1]))
         cur.currentTextChanged.connect(_on_curation)
 
-        btn = QPushButton("Load")
-        btn.clicked.connect(
-            lambda: self.lora_swap_requested.emit(
-                combo_a.currentText(), combo_b.currentText()
+        def _on_load():
+            try:
+                wa = float(weight_a.text())
+            except ValueError:
+                wa = 0.5
+            try:
+                wb = float(weight_b.text())
+            except ValueError:
+                wb = 0.5
+            self.lora_swap_requested.emit(
+                combo_a.currentText(), combo_b.currentText(), wa, wb
             )
-        )
+
+        btn = QPushButton("Load")
+        btn.clicked.connect(_on_load)
 
         layout.addWidget(QLabel("idx"))
         layout.addWidget(cur)
         layout.addWidget(combo_a)
+        layout.addWidget(weight_a)
         layout.addWidget(combo_b)
+        layout.addWidget(weight_b)
         layout.addWidget(btn)
         self.main_layout.addWidget(container)
-        self.controls[param_id] = (cur, combo_a, combo_b, btn)
+        self.controls[param_id] = (cur, combo_a, weight_a, combo_b, weight_b, btn)
 
     def add_text_input(self, param_id, param, default_value=None):
         """Add a text input control"""

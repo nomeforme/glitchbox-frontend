@@ -58,7 +58,7 @@ class WSClient(QThread):
 
     # ----- Qt signals -----
     capabilities_received = Signal(dict)        # server's session_ready ack
-    alpha_updated = Signal(float, float, float) # alpha, w_a, w_b
+    alpha_updated = Signal(float, float, float, float)  # alpha, w_a, w_b, level
     connection_error = Signal(str)
     status_changed = Signal(str)
     error_message = Signal(str)                 # server-pushed {"type":"error"}
@@ -143,17 +143,25 @@ class WSClient(QThread):
             self.loop,
         )
 
-    def swap_lora(self, slug_a: str, slug_b: str) -> None:
-        """Request a LoRA hot-swap (slug A / slug B). Heavy — stalls the
-        server a few seconds; the request/grant gate parks us meanwhile.
-        Thread-safe.
+    def swap_lora(
+        self,
+        slug_a: str,
+        slug_b: str,
+        weight_a: float = 0.5,
+        weight_b: float = 0.5,
+    ) -> None:
+        """Request a LoRA hot-swap (slug A/B + per-LoRA fuse weights). Heavy
+        — stalls the server a few seconds; the request/grant gate parks us
+        meanwhile. Thread-safe.
         """
         if not self.connected or self.loop is None:
             return
         asyncio.run_coroutine_threadsafe(
-            self._send_text(
-                {"type": "swap_lora", "slug_a": slug_a, "slug_b": slug_b}
-            ),
+            self._send_text({
+                "type": "swap_lora",
+                "slug_a": slug_a, "slug_b": slug_b,
+                "weight_a": float(weight_a), "weight_b": float(weight_b),
+            }),
             self.loop,
         )
 
@@ -289,6 +297,7 @@ class WSClient(QThread):
                         float(data.get("alpha", 0.0)),
                         float(data.get("w_a", 0.0)),
                         float(data.get("w_b", 0.0)),
+                        float(data.get("level", 0.0)),
                     )
                 elif t == "send_frame":
                     # Server gating us to ship the next frame. The UI

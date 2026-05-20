@@ -76,22 +76,64 @@ class AudioThread(QThread):
     # Thread main
     # ------------------------------------------------------------------
 
+    def _open_stream(self):
+        """Open an input stream — validate + enumerate like the original
+        glitchbox frontend's _test_device.
+
+        Tries the configured device first (None = system default), then
+        every device with input channels, each at 1 then 2 channels (the
+        callback downmixes multi-channel to mono). ``sd.check_input_settings``
+        validates before opening so a bad combo is rejected cleanly instead
+        of the opaque PortAudio -9998. All prints flush so the result is
+        actually visible in the (block-buffered) client log.
+        """
+        # Candidate devices: configured first, then all real inputs.
+        candidate_devs = [self.input_device_index]
+        try:
+            for i, d in enumerate(sd.query_devices()):
+                if d.get("max_input_channels", 0) > 0 and i not in candidate_devs:
+                    candidate_devs.append(i)
+        except Exception as e:
+            print(f"[AudioThread] device enumeration failed: {e}", flush=True)
+
+        for dev in candidate_devs:
+            for ch in (1, 2):
+                try:
+                    sd.check_input_settings(
+                        device=dev, channels=ch, dtype="int16",
+                        samplerate=self.sample_rate,
+                    )
+                    stream = sd.InputStream(
+                        device=dev,
+                        channels=ch,
+                        samplerate=self.sample_rate,
+                        dtype="int16",
+                        blocksize=self.frames_per_chunk,
+                        callback=self._audio_callback,
+                    )
+                    stream.start()
+                    print(
+                        f"[AudioThread] Capturing device={dev} channels={ch} "
+                        f"@ {self.sample_rate} Hz, {self.chunk_ms} ms chunks",
+                        flush=True,
+                    )
+                    return stream
+                except Exception as e:
+                    print(
+                        f"[AudioThread] device={dev} channels={ch} failed: {e}",
+                        flush=True,
+                    )
+        raise RuntimeError("no working input device found")
+
     def run(self) -> None:
         self.running = True
+        print(
+            f"[AudioThread] run() entered (configured device="
+            f"{self.input_device_index})",
+            flush=True,
+        )
         try:
-            self._stream = sd.InputStream(
-                device=self.input_device_index,
-                channels=1,
-                samplerate=self.sample_rate,
-                dtype="int16",
-                blocksize=self.frames_per_chunk,
-                callback=self._audio_callback,
-            )
-            self._stream.start()
-            print(
-                f"[AudioThread] Capturing @ {self.sample_rate} Hz, "
-                f"{self.chunk_ms} ms chunks, device={self.input_device_index}"
-            )
+            self._stream = self._open_stream()
             while self.running:
                 try:
                     chunk = self._q.get(timeout=0.1)

@@ -285,9 +285,12 @@ class MainWindow(QMainWindow):
         mic_layout = QHBoxLayout()
         mic_label = QLabel("Microphone Index:")
         self.mic_spinbox = QSpinBox()
-        self.mic_spinbox.setMinimum(0)
+        self.mic_spinbox.setMinimum(-1)  # -1 = system default input device
         self.mic_spinbox.setMaximum(50)  # Audio devices can have higher indices
-        self.mic_spinbox.setValue(self.audio_device_index)
+        # audio_device_index may be None (system default) → show as -1.
+        self.mic_spinbox.setValue(
+            self.audio_device_index if self.audio_device_index is not None else -1
+        )
         
         # Set tooltip with detected microphones
         if self.available_microphones:
@@ -1033,9 +1036,12 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[UI/V2] Error starting fresh stream: {e}")
 
-    def _v2_handle_alpha(self, alpha: float, w_a: float, w_b: float):
-        """Render the audio-driven α + LoRA-blend weights into the
-        status bar. Throttled to roughly 1 Hz at 20-30 fps."""
+    def _v2_handle_alpha(self, alpha: float, w_a: float, w_b: float, level: float = 0.0):
+        """Render the audio meter (every frame, for clap responsiveness)
+        and the α/blend readout (throttled ~1 Hz)."""
+        # Live audio level meter — update every frame so transients show.
+        self.status_bar.update_audio_level(level)
+        # α / weights text — throttled so it doesn't thrash at 20-30 fps.
         self._v2_alpha_throttle += 1
         if self._v2_alpha_throttle < 20:
             return
@@ -2002,7 +2008,10 @@ class MainWindow(QMainWindow):
     def update_mic_index(self):
         """Update the microphone device index"""
         new_index = self.mic_spinbox.value()
-        
+        # -1 in the spinbox means "system default input device" (None).
+        if new_index < 0:
+            new_index = None
+
         if new_index == self.audio_device_index:
             self.status_bar.update_processing_status(f"Microphone already using index {new_index}")
             return

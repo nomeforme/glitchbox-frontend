@@ -20,6 +20,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# Unbuffered stdout/stderr so QThread prints (WSClient, AudioThread, …)
+# appear immediately in logs instead of sitting in a block buffer when
+# stdout is a pipe rather than a TTY.
+export PYTHONUNBUFFERED=1
+
 if [[ "${GLITCHBOX_STT_ENABLED:-0}" == "1" ]]; then
     CUDNN_LIB_DIR="$(uv run python -c 'import os, nvidia.cudnn; print(os.path.join(nvidia.cudnn.__path__[0], "lib"))')"
     export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:${CUDNN_LIB_DIR}"

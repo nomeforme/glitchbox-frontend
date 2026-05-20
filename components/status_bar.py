@@ -34,14 +34,32 @@ class StatusBar(QWidget):
         
         # Add stretch to push server info to the right
         self.layout.addStretch()
-        
+
+        # Live audio level meter (top-right, by the status). Reflects the
+        # raw mic peak from the server telemetry — claps spike it even in a
+        # quiet room (unlike the percentile-normalized α).
+        self.audio_label = QLabel("audio ░░░░░░░░░░")
+        self.audio_label.setStyleSheet("font-family: monospace;")
+        self.audio_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.layout.addWidget(self.audio_label)
+        self.layout.addSpacing(8)
+
         # Server info on the right
         self.proc_status = QLabel("")
         self.proc_status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.layout.addWidget(self.proc_status)
-        
+
         self.setMinimumHeight(35)
         self.setMaximumHeight(40)
+
+    def update_audio_level(self, level: float):
+        """Render a 10-cell bar for the raw mic level (0..1) + color cue."""
+        level = max(0.0, min(1.0, float(level)))
+        cells = int(round(level * 10))
+        bar = "█" * cells + "░" * (10 - cells)
+        color = "green" if level > 0.02 else "gray"
+        self.audio_label.setText(f"audio {bar} {level:.2f}")
+        self.audio_label.setStyleSheet(f"font-family: monospace; color: {color};")
 
     def update_connection_status(self, connected: bool):
         """Update connection status display"""

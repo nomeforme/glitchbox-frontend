@@ -9,7 +9,10 @@ DISPLAY_WIDTH = 1024
 DISPLAY_HEIGHT = 768
 DISPLAY_SCALE = 1.0
 CAMERA_DEVICE_INDEX = 0 #0 #42
-MIC_DEVICE_INDEX = 0 #16
+# None = system default input device. A hardcoded 0 is often NOT a capture
+# device (→ PortAudio -9998 invalid-channel-count). Set to a specific input
+# index from `python -m sounddevice` if you want a particular mic.
+MIC_DEVICE_INDEX = None
 
 # Client-owned AV capture params (sent to the realtime server in the
 # handshake — these are facts about THIS machine's mic/camera, not server
