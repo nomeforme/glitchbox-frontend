@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                              QSlider, QCheckBox, QLabel, QLineEdit,
-                             QScrollArea, QFrame, QComboBox)
+                             QScrollArea, QFrame, QComboBox, QPushButton)
 from PySide6.QtCore import Qt, Signal
 
 # Minimum heights for controls
@@ -16,6 +16,9 @@ class ControlPanel(QWidget):
     # server marked `live_adjustable` in its session_ready capabilities.
     # `main.py` wires this to `WSClient.update_knob`.
     knob_changed = Signal(str, object)       # (field, value)
+    # LoRA hot-swap request: (slug_a, slug_b). Emitted on the Load button;
+    # main.py wires it to WSClient.swap_lora.
+    lora_swap_requested = Signal(str, str)
 
     def __init__(self):
         super().__init__()
@@ -73,6 +76,8 @@ class ControlPanel(QWidget):
                 self.add_text_input(param_id, param, default_value)
             elif field_type == 'select':
                 self.add_select(param_id, param, default_value)
+            elif field_type == 'lora_swap':
+                self.add_lora_swap(param_id, param, default_value)
 
         # Add stretch at the end so controls stay at top
         self.main_layout.addStretch()
@@ -176,6 +181,64 @@ class ControlPanel(QWidget):
 
         self.main_layout.addWidget(container)
         self.controls[param_id] = combo
+
+    def add_lora_swap(self, param_id, param, default_value=None):
+        """Curation-index + two slug dropdowns (A, B) + Load button.
+
+        Deferred (unlike auto-firing knobs): nothing happens until Load is
+        pressed (a swap stalls the server a few seconds). The curation
+        dropdown is a quick-pick — selecting an index fills A/B from the
+        server's preset pairs (lora_index.yaml); A/B can also be set
+        manually. ``presets`` maps curation index → [slug_a, slug_b].
+        """
+        container = QWidget()
+        container.setMinimumHeight(SLIDER_MIN_HEIGHT)
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 4, 0, 4)
+
+        label = QLabel(param.get('title', param_id))
+        label.setMinimumWidth(150)
+        layout.addWidget(label)
+
+        options = [str(o) for o in param.get('options', [])]
+        presets = param.get('presets', {}) or {}
+
+        # Curation-index quick-pick (custom + sorted preset indices).
+        cur = QComboBox()
+        cur_keys = sorted(presets.keys(), key=lambda k: int(k) if str(k).isdigit() else k)
+        cur.addItems(["(custom)"] + [str(k) for k in cur_keys])
+
+        combo_a = QComboBox(); combo_a.addItems(options)
+        combo_b = QComboBox(); combo_b.addItems(options)
+        da = str(param.get('default_a', '')); db = str(param.get('default_b', ''))
+        if da in options:
+            combo_a.setCurrentText(da)
+        if db in options:
+            combo_b.setCurrentText(db)
+
+        def _on_curation(idx_text):
+            pair = presets.get(idx_text)
+            if pair and len(pair) == 2:
+                if str(pair[0]) in options:
+                    combo_a.setCurrentText(str(pair[0]))
+                if str(pair[1]) in options:
+                    combo_b.setCurrentText(str(pair[1]))
+        cur.currentTextChanged.connect(_on_curation)
+
+        btn = QPushButton("Load")
+        btn.clicked.connect(
+            lambda: self.lora_swap_requested.emit(
+                combo_a.currentText(), combo_b.currentText()
+            )
+        )
+
+        layout.addWidget(QLabel("idx"))
+        layout.addWidget(cur)
+        layout.addWidget(combo_a)
+        layout.addWidget(combo_b)
+        layout.addWidget(btn)
+        self.main_layout.addWidget(container)
+        self.controls[param_id] = (cur, combo_a, combo_b, btn)
 
     def add_text_input(self, param_id, param, default_value=None):
         """Add a text input control"""

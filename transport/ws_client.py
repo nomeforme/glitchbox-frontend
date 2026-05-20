@@ -143,6 +143,20 @@ class WSClient(QThread):
             self.loop,
         )
 
+    def swap_lora(self, slug_a: str, slug_b: str) -> None:
+        """Request a LoRA hot-swap (slug A / slug B). Heavy — stalls the
+        server a few seconds; the request/grant gate parks us meanwhile.
+        Thread-safe.
+        """
+        if not self.connected or self.loop is None:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._send_text(
+                {"type": "swap_lora", "slug_a": slug_a, "slug_b": slug_b}
+            ),
+            self.loop,
+        )
+
     def close(self) -> None:
         """Request graceful shutdown from another thread."""
         self.running = False

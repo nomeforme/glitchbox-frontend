@@ -541,6 +541,10 @@ class MainWindow(QMainWindow):
             self.ws_client_v2.status_changed.connect(self.handle_status_change)
             # Live-knob updates flow control_panel → ws_client_v2.update_knob
             self.control_panel.knob_changed.connect(self.ws_client_v2.update_knob)
+            # LoRA hot-swap (Load button) → ws_client_v2.swap_lora
+            self.control_panel.lora_swap_requested.connect(
+                self.ws_client_v2.swap_lora
+            )
 
             # Audio thread (raw PCM, no client-side FFT). The client OWNS
             # its mic rate (CLIENT_SAMPLE_RATE) and ships it to the server
