@@ -106,6 +106,9 @@ class SessionConfig:
     lora_blend_curve: str = "cosine_tent"
     lora_blend_curve_scale: float = 1.0
     audio_lora_blend_method: str = "naive"
+    # Fixed-fuse the 2-LoRA pair (no per-frame blend) at curve(lora_fixed_alpha).
+    lora_fuse_fixed: bool = False
+    lora_fixed_alpha: float = 0.5
 
     # ----- Latent carryover (Proposals E + F) -----
     latent_carryover: float = 0.2
