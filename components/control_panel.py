@@ -58,13 +58,23 @@ class ControlPanel(QWidget):
         # Extract parameters from settings
         params = settings.get('input_params', {}).get('properties', {})
         default_values = {}
-        
+
         # Get default values from server settings
         for param_id, param in params.items():
             default_values[param_id] = param.get('default', 0)
-        
+
+        # Render in the server-specified semantic order. Each descriptor
+        # carries an explicit ``order`` int (lower = higher on the panel);
+        # this is independent of dict-insertion quirks and of the fact that
+        # the server merges some controls (e.g. lora_swap) in separately.
+        # Params without ``order`` sink to the bottom (stable by id).
+        ordered = sorted(
+            params.items(),
+            key=lambda kv: (kv[1].get('order', 10_000), kv[0]),
+        )
+
         # Add controls based on parameters
-        for param_id, param in params.items():
+        for param_id, param in ordered:
             field_type = param.get('field')
             default_value = default_values.get(param_id)
 
