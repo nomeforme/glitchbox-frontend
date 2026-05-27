@@ -294,9 +294,44 @@ class ProjectionMapperWindow(QMainWindow):
         quick_group.setLayout(quick_layout)
         right_layout.addWidget(quick_group)
 
+        # Read-only prompt-travel context: the four bilinear corners the
+        # journey is currently interpolating between (from = current waypoint,
+        # to = next; A/B = the two LoRA-pair sides). Populated live from the
+        # server's per-frame telemetry via update_prompt_context().
+        prompt_group = QGroupBox("Prompt Travel (read-only)")
+        prompt_layout = QGridLayout()
+        self.prompt_labels = {}
+        # Fixed render order (From A, To A, From B, To B) and fixed row heights
+        # so the rows never reorder or reflow/jump as prompt-text length changes
+        # frame-to-frame. Each side's from→to sits together for easy reading.
+        for row, (key, title) in enumerate((
+            ("from_a", "From A"), ("to_a", "To A"),
+            ("from_b", "From B"), ("to_b", "To B"),
+        )):
+            title_lbl = QLabel(f"{title}:")
+            title_lbl.setStyleSheet("font-weight: bold;")
+            title_lbl.setAlignment(Qt.AlignTop)
+            value_lbl = QLabel("—")
+            value_lbl.setWordWrap(True)
+            value_lbl.setFixedHeight(56)
+            value_lbl.setAlignment(Qt.AlignTop)
+            value_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            prompt_layout.addWidget(title_lbl, row, 0, Qt.AlignTop)
+            prompt_layout.addWidget(value_lbl, row, 1)
+            self.prompt_labels[key] = value_lbl
+        prompt_layout.setColumnStretch(1, 1)
+        prompt_group.setLayout(prompt_layout)
+        right_layout.addWidget(prompt_group)
+
         right_layout.addStretch()
 
         main_layout.addWidget(right_widget, stretch=1)
+
+    def update_prompt_context(self, from_a, from_b, to_a, to_b):
+        """Set the read-only prompt-travel labels (live from telemetry)."""
+        vals = {"from_a": from_a, "from_b": from_b, "to_a": to_a, "to_b": to_b}
+        for key, label in getattr(self, "prompt_labels", {}).items():
+            label.setText(vals.get(key) or "—")
 
     def update_corner(self, corner_idx, coord_idx, value):
         """Update a corner point coordinate from spinbox"""

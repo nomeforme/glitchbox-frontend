@@ -542,6 +542,10 @@ class MainWindow(QMainWindow):
             )
             self.ws_client_v2.connection_error.connect(self.handle_connection_error)
             self.ws_client_v2.status_changed.connect(self.handle_status_change)
+            # Read-only prompt-travel context → projection mapper modal.
+            self.ws_client_v2.prompt_context_updated.connect(
+                self._v2_on_prompt_context
+            )
             # Live-knob updates flow control_panel → ws_client_v2.update_knob
             self.control_panel.knob_changed.connect(self.ws_client_v2.update_knob)
             # LoRA hot-swap (Load button) → ws_client_v2.swap_lora
@@ -1003,6 +1007,13 @@ class MainWindow(QMainWindow):
             # No frame in slot yet — the next ``_v2_handle_camera_frame``
             # will ship immediately and consume this grant.
             self._v2_grant_held = True
+
+    def _v2_on_prompt_context(self, from_a, from_b, to_a, to_b):
+        """Forward the live prompt-travel context (4 bilinear corners) to the
+        projection-mapper modal's read-only display, if it's open."""
+        pm = getattr(self.processed_display, "projection_mapper", None)
+        if pm is not None and hasattr(pm, "update_prompt_context"):
+            pm.update_prompt_context(from_a, from_b, to_a, to_b)
 
     def _v2_on_capabilities(self, caps):
         """V2 handshake-complete handler — kicks the ZMQ subscriber so

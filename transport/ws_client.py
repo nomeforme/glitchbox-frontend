@@ -59,6 +59,9 @@ class WSClient(QThread):
     # ----- Qt signals -----
     capabilities_received = Signal(dict)        # server's session_ready ack
     alpha_updated = Signal(float, float, float, float)  # alpha, w_a, w_b, level
+    # Read-only prompt-travel context from the per-frame telemetry:
+    # (from_a, from_b, to_a, to_b) — the four bilinear prompt corners.
+    prompt_context_updated = Signal(str, str, str, str)
     connection_error = Signal(str)
     status_changed = Signal(str)
     error_message = Signal(str)                 # server-pushed {"type":"error"}
@@ -299,6 +302,12 @@ class WSClient(QThread):
                         float(data.get("w_b", 0.0)),
                         float(data.get("level", 0.0)),
                     )
+                    p = data.get("prompts")
+                    if isinstance(p, dict):
+                        self.prompt_context_updated.emit(
+                            str(p.get("from_a", "")), str(p.get("from_b", "")),
+                            str(p.get("to_a", "")), str(p.get("to_b", "")),
+                        )
                 elif t == "send_frame":
                     # Server gating us to ship the next frame. The UI
                     # thread holds the most recent camera frame in a
