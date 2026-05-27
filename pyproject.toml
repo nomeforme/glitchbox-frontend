@@ -36,6 +36,22 @@ dependencies = [
     "websockets==14.2",
 ]
 
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["main", "config"]
+
+[tool.setuptools.packages.find]
+include = ["clients*", "components*", "modules*", "threads*", "transport*", "utils*"]
+
+[tool.uv]
+# av 14.x is source-only on PyPI and requires FFmpeg 7 to build. Ubuntu 24.04
+# ships FFmpeg 6.1, so pin av to 13.1.0, which publishes a manylinux wheel with
+# bundled FFmpeg (faster-whisper only requires av>=11). Avoids any system FFmpeg dep.
+constraint-dependencies = ["av==13.1.0"]
+
 [tool.uv.workspace]
 members = ["server"]
 
