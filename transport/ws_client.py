@@ -169,13 +169,27 @@ class WSClient(QThread):
         )
 
     def close(self) -> None:
-        """Request graceful shutdown from another thread."""
+        """Request graceful shutdown from another thread.
+
+        Sets ``running=False`` and, if a socket is live, schedules its close
+        on the worker event loop so a blocked ``_recv_loop`` (parked in
+        ``async for msg in websocket``) wakes immediately instead of hanging
+        until the next server message. Without this, ``stop()`` would wait
+        out its full timeout and then hard-``terminate()`` the thread.
+        """
         self.running = False
+        loop = self.loop
+        ws = self.websocket
+        if loop is not None and ws is not None and not loop.is_closed():
+            try:
+                asyncio.run_coroutine_threadsafe(ws.close(), loop)
+            except Exception as e:
+                print(f"[WSClient] close() schedule failed: {e}")
 
     def stop(self) -> None:
         """Stop the client and wait briefly for the thread to exit."""
         print("[WSClient] Stopping")
-        self.running = False
+        self.close()
         self.connected = False
         if not self.wait(1500):
             print("[WSClient] Thread did not exit cleanly, terminating")
@@ -233,6 +247,11 @@ class WSClient(QThread):
             data = json.loads(msg)
             if data.get("type") == "session_ready":
                 caps = data.get("capabilities", {})
+                # Mark connected BEFORE emitting: the capabilities slot runs
+                # on the Qt main thread and may call update_knob (to restore
+                # the client's last settings), which early-returns when not
+                # connected. Setting it here closes that race.
+                self.connected = True
                 self.capabilities_received.emit(caps)
                 self.status_changed.emit("connected")
                 return True
@@ -261,6 +280,20 @@ class WSClient(QThread):
             print(f"[WSClient] Connect failed: {e}")
             return False
 
+    async def _sleep_interruptible(self, delay: float) -> None:
+        """Backoff sleep that wakes promptly when ``running`` flips False.
+
+        Lets a Qt-thread ``stop()``/``close()`` interrupt a long reconnect
+        backoff so a manual disconnect/reconnect doesn't wait out the full
+        delay (and so the thread exits within ``stop()``'s wait window,
+        avoiding a hard ``terminate()``).
+        """
+        step = 0.1
+        waited = 0.0
+        while waited < delay and self.running:
+            await asyncio.sleep(step)
+            waited += step
+
     async def _poll_connection(self) -> bool:
         """Retry connect with exponential backoff (capped at 30 s)."""
         while self.running and not self.connected and self.retry_count < self.max_retries:
@@ -273,9 +306,14 @@ class WSClient(QThread):
             self.retry_delay = min(
                 self.initial_retry_delay * (2 ** (self.retry_count - 1)), 30.0
             )
-            await asyncio.sleep(self.retry_delay)
+            await self._sleep_interruptible(self.retry_delay)
         if not self.connected:
-            self.connection_error.emit("Connection failed after maximum retries")
+            # Suppress the terminal error when we landed here because of an
+            # intentional stop() (running flipped False) rather than genuine
+            # retry exhaustion — otherwise a manual disconnect/reconnect would
+            # flash a spurious "Connection failed" in the UI.
+            if self.running:
+                self.connection_error.emit("Connection failed after maximum retries")
             self.status_changed.emit("disconnected")
             return False
         return True

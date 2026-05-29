@@ -23,6 +23,9 @@ class ControlPanel(QWidget):
     def __init__(self):
         super().__init__()
         self.controls = {}
+        # param_id of the lora_swap control, if one was rendered. Lets
+        # set_lora_selection() find it without guessing at tuple shapes.
+        self._lora_param_id = None
         # Capabilities map from the realtime server's session_ready ack.
         # Populated by `apply_capabilities`; empty dict = no classification
         # known yet (= legacy behavior: every field is freely adjustable).
@@ -268,6 +271,7 @@ class ControlPanel(QWidget):
         layout.addWidget(btn)
         self.main_layout.addWidget(container)
         self.controls[param_id] = (cur, combo_a, weight_a, combo_b, weight_b, btn)
+        self._lora_param_id = param_id
 
     def add_text_input(self, param_id, param, default_value=None):
         """Add a text input control"""
@@ -378,13 +382,43 @@ class ControlPanel(QWidget):
             return
             
         control = self.controls[param_id]
-        if isinstance(control, tuple):  # Slider
+        if isinstance(control, tuple) and len(control) == 2:  # Slider (slider, value_edit)
             slider, value_edit = control
             slider.setValue(int(value * 100))
             value_edit.setText(f"{value:.2f}")
+        elif isinstance(control, tuple):
+            # Composite control (e.g. lora_swap's 6-tuple) — not a scalar
+            # value. Use the dedicated setter (set_lora_selection) instead.
+            return
         elif isinstance(control, QCheckBox):
             control.setChecked(value)
         elif isinstance(control, QComboBox):
             control.setCurrentText(str(value))
         elif isinstance(control, QLineEdit):
             control.setText(str(value))
+
+    def set_lora_selection(self, slug_a, slug_b, weight_a, weight_b):
+        """Programmatically set the LoRA A/B slugs + fuse weights.
+
+        Used to restore the client's last-loaded LoRA pair after a reconnect.
+        Does NOT press Load — the caller fires the swap on the server
+        separately. Returns True only if both slugs still exist in the
+        (rebuilt) dropdowns; returns False and changes nothing otherwise, so
+        the caller can decide whether to re-fire the swap.
+        """
+        if self._lora_param_id is None or self._lora_param_id not in self.controls:
+            return False
+        control = self.controls[self._lora_param_id]
+        if not (isinstance(control, tuple) and len(control) == 6):
+            return False
+        cur, combo_a, weight_a_edit, combo_b, weight_b_edit, _btn = control
+        sa, sb = str(slug_a), str(slug_b)
+        if combo_a.findText(sa) < 0 or combo_b.findText(sb) < 0:
+            return False
+        # "(custom)" so the curation quick-pick doesn't overwrite A/B.
+        cur.setCurrentText("(custom)")
+        combo_a.setCurrentText(sa)
+        combo_b.setCurrentText(sb)
+        weight_a_edit.setText(str(weight_a))
+        weight_b_edit.setText(str(weight_b))
+        return True

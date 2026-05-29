@@ -363,22 +363,14 @@ class MainWindow(QMainWindow):
         # Create horizontal layout for buttons
         buttons_layout = QHBoxLayout()
         
-        # Connect to Server button
+        # Single idempotent connection toggle. One button switches between
+        # Connect and Disconnect; "reconnect" is just Connect again (it tears
+        # down any running client first), so first-connect, manual reconnect,
+        # and the server-initiated auto-reconnect all share one code path.
+        # See toggle_connection / connect_to_server / disconnect_from_server.
         self.connect_button = QPushButton("Connect to Server")
-        self.connect_button.clicked.connect(self.connect_to_server)
+        self.connect_button.clicked.connect(self.toggle_connection)
         buttons_layout.addWidget(self.connect_button)
-        
-        # Disconnect from Server button
-        self.disconnect_button = QPushButton("Disconnect from Server")
-        self.disconnect_button.clicked.connect(self.disconnect_from_server)
-        self.disconnect_button.setEnabled(False)  # Only enabled when connected
-        buttons_layout.addWidget(self.disconnect_button)
-        
-        # Reconnect button (renamed for clarity)
-        self.reconnect_button = QPushButton("Reconnect to Server")
-        self.reconnect_button.clicked.connect(self.reconnect_to_server)
-        self.reconnect_button.setEnabled(False)  # Only enabled when connected
-        buttons_layout.addWidget(self.reconnect_button)
         
         # Start/Stop Camera button
         self.start_button = QPushButton("Start Camera")
@@ -552,6 +544,18 @@ class MainWindow(QMainWindow):
             self.control_panel.lora_swap_requested.connect(
                 self.ws_client_v2.swap_lora
             )
+            # Remember the last LoRA pair the user loaded so a reconnect can
+            # restore it — the server rebuilds the session at the preset's
+            # default LoRA, so this must be re-fired (see _v2_restore_lora).
+            self._lora_selection = None
+            self.control_panel.lora_swap_requested.connect(self._v2_remember_lora)
+            # Remember the latest value of each live knob the user changes, so
+            # a reconnect can restore the session's active settings instead of
+            # snapping back to the server's defaults. The control panel is
+            # rebuilt from defaults on every handshake (see _v2_build_controls);
+            # _v2_restore_knobs replays this dict afterwards.
+            self._knob_values: dict = {}
+            self.control_panel.knob_changed.connect(self._v2_remember_knob)
 
             # Audio thread (raw PCM, no client-side FFT). The client OWNS
             # its mic rate (CLIENT_SAMPLE_RATE) and ships it to the server
@@ -621,6 +625,11 @@ class MainWindow(QMainWindow):
         # Add separate state tracking for camera and server connection
         self.camera_running = False
         self.server_connected = False
+        # User intent for the connection toggle. True from the moment the
+        # user clicks Connect until they click Disconnect — independent of
+        # transient socket drops, so the button label stays meaningful while
+        # the client auto-reconnects in the background.
+        self._user_wants_connected = False
 
         # Create signal handler for curation updates
         self.curation_signal_handler = CurationUpdateSignalHandler()
@@ -641,154 +650,162 @@ class MainWindow(QMainWindow):
             print("[UI] Automatic curation updates disabled in config")
         print(f"[UI] Curation index range: 0 to {CURATION_INDEX_MAX}")
 
-    def get_initial_settings(self):
-        """Start WebSocket client to get initial settings"""
-        print("[UI] get_initial_settings called - starting WebSocket client...")
-        self.status_bar.update_processing_status("Connecting to server...")
-        # Disable all connection buttons during connection
-        self.connect_button.setEnabled(False)
-        self.disconnect_button.setEnabled(False)
-        self.reconnect_button.setEnabled(False)
-        
+    def _refresh_connection_button(self):
+        """Single source of truth for the connection toggle button.
+
+        The label tracks user *intent* (`_user_wants_connected`), not the
+        transient socket state, so the button stays meaningful while the
+        client is mid-(re)connect: it reads "Disconnect from Server" the
+        whole time you want to be connected — letting you abort a stuck
+        reconnect — and "Connect to Server" once you've disconnected. Always
+        enabled; that's what makes the toggle idempotent.
+        """
+        if self._user_wants_connected:
+            self.connect_button.setText("Disconnect from Server")
+        else:
+            self.connect_button.setText("Connect to Server")
+        self.connect_button.setEnabled(True)
+
+    def toggle_connection(self):
+        """Idempotent Connect/Disconnect toggle — the single button's slot."""
+        if self._user_wants_connected:
+            self.disconnect_from_server()
+        else:
+            self.connect_to_server()
+
+    def _on_connection_terminated(self, reason: str):
+        """The client gave up (max retries) or failed to start.
+
+        Returns the UI to the disconnected state so the toggle reads
+        "Connect to Server" and the next click starts a fresh attempt.
+        """
+        self._user_wants_connected = False
+        self.server_connected = False
+        self.status_bar.update_connection_status(False)
+        self._refresh_connection_button()
+        self.status_bar.update_processing_status(reason)
+
+    def _start_network_clients(self):
+        """Start the active protocol's WebSocket client (idempotent).
+
+        The single connect primitive shared by first-connect, manual
+        reconnect, and the curation-triggered reconnect. Any client still
+        running is stopped first, so every path is identical.
+
+        Only the client for the active protocol is started: under
+        REALTIME_V2 that's the realtime ``WSClient``. The legacy client is
+        left idle — starting it against the realtime server just spams
+        ``/api/settings`` with 404s and races the V2 status signals.
+        """
+        # Clean slate — this is what makes connect and reconnect one path.
+        self._stop_network_clients()
+
+        # Fresh connection: let the one-shot V2 gate diagnostics print again.
+        self._v2_cam_disconnect_logged = False
+        self._v2_first_cam_frame_logged = False
+        self._v2_first_send_logged = False
+
         try:
-            print(f"[UI] Starting WebSocket client with URI: {self.ws_client.uri}")
-            print(f"[UI] WebSocket client user_id: {self.ws_client.user_id}")
-            self.ws_client.start()
-            print("[UI] WebSocket client start() called successfully")
-            # V2 parallel-path start. The legacy client above hits the
-            # glitchbox-server endpoints (/api/settings, /api/ws/{id}); the
-            # V2 client hits the realtime endpoints (/defaults, /live).
-            # Both run in parallel during cutover so the UI keeps working
-            # against either backend, controlled by GLITCHBOX_REALTIME_V2.
             if REALTIME_V2 and hasattr(self, "ws_client_v2"):
                 print("[UI] Starting V2 WSClient (realtime protocol)")
                 self.ws_client_v2.start()
+            else:
+                print(f"[UI] Starting legacy WebSocket client: {self.ws_client.uri}")
+                self.ws_client.start()
         except Exception as e:
             print(f"[UI] Error starting WebSocket client: {e}")
-            self.status_bar.update_processing_status(f"Failed to start connection: {e}")
-            # Re-enable buttons on error - allow connect and reconnect attempts
-            self.connect_button.setEnabled(True)
-            self.disconnect_button.setEnabled(False)
-            self.reconnect_button.setEnabled(True)  # Enable reconnect on connection error
+            self._on_connection_terminated(f"Failed to start connection: {e}")
+
+    def _stop_network_clients(self):
+        """Stop whichever WebSocket client threads are running (idempotent).
+
+        Stops BOTH clients if alive. Earlier builds only stopped the legacy
+        client, so the realtime thread leaked across disconnect/reconnect and
+        kept auto-retrying behind the UI's back.
+        """
+        v2 = getattr(self, "ws_client_v2", None)
+        if v2 is not None:
+            try:
+                if v2.isRunning():
+                    v2.stop()
+            except Exception as e:
+                print(f"[UI] Error stopping V2 client: {e}")
+        v1 = getattr(self, "ws_client", None)
+        if v1 is not None:
+            try:
+                v1.close()
+                if v1.isRunning():
+                    v1.stop()
+            except Exception as e:
+                print(f"[UI] Error stopping legacy client: {e}")
 
     def connect_to_server(self):
-        """Connect to server"""
-        if not self.server_connected:
-            self.get_initial_settings()
-        else:
-            self.status_bar.update_processing_status("Already connected to server")
+        """Connect to the server (also serves as reconnect).
+
+        Idempotent: records that the user wants to be connected, then
+        (re)starts the client from a clean state. Safe to call when already
+        connected — it simply reconnects.
+        """
+        print("[UI] Connect requested")
+        self._user_wants_connected = True
+        self._refresh_connection_button()
+        self.status_bar.update_processing_status("Connecting to server...")
+        self._start_network_clients()
 
     def disconnect_from_server(self):
-        """Disconnect from server with proper cleanup"""
-        if not self.server_connected:
-            self.status_bar.update_processing_status("Not connected to server")
-            return
-            
-        print("[UI] Disconnecting from server...")
-        self.status_bar.update_processing_status("Disconnecting from server...")
-        
-        # Disable buttons during disconnection
-        self.connect_button.setEnabled(False)
-        self.disconnect_button.setEnabled(False)
-        self.reconnect_button.setEnabled(False)
-        
-        # Immediately update connection state to prevent further operations
+        """Disconnect from the server and tear down streaming (idempotent).
+
+        Safe to call when already disconnected — it just settles the UI into
+        the disconnected state. Stops BOTH client threads so nothing keeps
+        auto-reconnecting after the user explicitly disconnects.
+        """
+        print("[UI] Disconnect requested")
+        self._user_wants_connected = False
         self.server_connected = False
+        self._refresh_connection_button()
         self.status_bar.update_connection_status(False)
-        
-        # Stop frame processing immediately
-        print("[UI] Stopping frame processing...")
+        self.status_bar.update_processing_status("Disconnecting from server...")
+
+        # Stop frame processing + output display immediately.
         self.frame_timer.stop()
         self.processing_frame = False
-        
-        # Stop the processed display stream immediately
-        print("[UI] Stopping processed display stream...")
-        # Clear ZMQ queue first to prevent blocking on pending messages
         self.processed_display.clear_zmq_queue()
         self.processed_display.stop_stream()
         self.processed_display.clear_display()
-        
-        # Stop automatic curation update timer
+
+        # Stop the automatic curation update timer.
         if self.curation_auto_timer.isActive():
-            print("[UI] Stopping automatic curation update timer")
             self.curation_auto_timer.stop()
-            # Update button text to reflect inactive state
             if hasattr(self, 'toggle_auto_curation_button'):
                 self.toggle_auto_curation_button.setText("Start Auto Curation Updates")
-        
-        # Use QTimer to perform cleanup asynchronously to avoid blocking UI
-        def perform_async_cleanup():
+
+        # Tell the server to stop streaming (legacy no-op under V2), then
+        # stop the client thread(s). _stop_network_clients() is bounded and
+        # terminate-free now that close() interrupts the socket/backoff.
+        if self.camera_running:
             try:
-                print("[UI] Starting async cleanup...")
-                
-                # Stop streaming if camera was running
-                if self.camera_running:
-                    print("[UI] Stopping camera streaming to server...")
-                    try:
-                        self.ws_client.stop_camera()
-                    except Exception as e:
-                        print(f"[UI] Error stopping camera streaming: {e}")
-                
-                # Gracefully close the WebSocket connection
-                print("[UI] Gracefully closing WebSocket connection...")
-                try:
-                    self.ws_client.close()
-                except Exception as e:
-                    print(f"[UI] Error during close: {e}")
-                
-                print("[UI] Async cleanup completed")
-                
+                self.ws_client.stop_camera()
             except Exception as e:
-                print(f"[UI] Error during async cleanup: {e}")
-            
-            # Schedule the final cleanup after a short delay
-            QTimer.singleShot(200, perform_final_cleanup)
-        
-        def perform_final_cleanup():
-            try:
-                print("[UI] Starting final cleanup...")
-                
-                # Stop the WebSocket client thread (non-blocking approach)
-                if hasattr(self, 'ws_client'):
-                    print("[UI] Stopping WebSocket client thread...")
-                    self.ws_client.stop()
-                
-                # Restart frame timer if camera is still running
-                if self.camera_running:
-                    print("[UI] Restarting frame timer for local camera display...")
-                    self.frame_timer.start()
-                
-                print("[UI] Server disconnection completed successfully")
-                
-            except Exception as e:
-                print(f"[UI] Error during final cleanup: {e}")
-                # Try to restart frame timer if camera is running, even after error
-                if self.camera_running and not self.frame_timer.isActive():
-                    self.frame_timer.start()
-            finally:
-                # Always update UI state regardless of errors
-                self.connect_button.setEnabled(True)
-                self.disconnect_button.setEnabled(False)
-                self.reconnect_button.setEnabled(True)  # Enable reconnect when disconnected
-                
-                # Update status based on camera state
-                if self.camera_running:
-                    self.status_bar.update_processing_status("Camera running (not streaming - disconnected)")
-                else:
-                    self.status_bar.update_processing_status("Disconnected from server")
-        
-        # Start the async cleanup with a small delay to let the UI update
-        QTimer.singleShot(50, perform_async_cleanup)
+                print(f"[UI] Error stopping camera streaming: {e}")
+        self._stop_network_clients()
+
+        # Keep the local camera preview alive if the camera is still on.
+        if self.camera_running:
+            if not self.frame_timer.isActive():
+                self.frame_timer.start()
+            self.status_bar.update_processing_status("Camera running (not streaming - disconnected)")
+        else:
+            self.status_bar.update_processing_status("Disconnected from server")
+        print("[UI] Server disconnection completed")
 
     def handle_settings(self, settings):
         """Handle received pipeline settings"""
         self.control_panel.setup_pipeline_options(settings)
         self.server_connected = True
         
-        # Update UI state - when connected, disable connect and reconnect buttons
-        self.connect_button.setEnabled(False)  # Disable connect when already connected
-        self.disconnect_button.setEnabled(True)  # Enable disconnect button when connected
-        self.reconnect_button.setEnabled(False)  # Disable reconnect when already connected
+        # Connected — reflect it on the single toggle button.
+        self._user_wants_connected = True
+        self._refresh_connection_button()
         self.status_bar.update_processing_status(f"Connected to server: {self.server_host}:{self.server_port}")
         
         # Reset reconnection count on successful connection
@@ -842,55 +859,52 @@ class MainWindow(QMainWindow):
         self.status_bar.update_processing_status(f"Params updated from server: {', '.join(params.keys())}")
 
     def handle_status_change(self, status: str):
-        """Handle WebSocket status changes"""
-        if status.startswith("Retrying connection"):
-            self.status_bar.update_processing_status(f"Retrying connection to {self.server_host}:{self.server_port}...")
+        """Handle WebSocket status changes."""
+        if status.startswith("Retrying connection") or status.startswith("Retrying to fetch"):
+            self.status_bar.update_processing_status(
+                f"Reconnecting to {self.server_host}:{self.server_port}..."
+            )
         elif status == "connected":
+            self.server_connected = True
             self.status_bar.update_connection_status(True)
-            # Update the status bar with server info
-            self.status_bar.update_processing_status(f"Connected to server: {self.server_host}:{self.server_port}")
-            # NOTE: Stream is already started in handle_settings() - no need to start it again here
-            # to prevent duplication that causes FPS counter hallucination
-            print("[UI] WebSocket connected - stream should already be active from handle_settings()")
-            # Update buttons on successful connection - disable connect and reconnect when connected
-            self.connect_button.setEnabled(False)  # Disable connect when already connected
-            self.disconnect_button.setEnabled(True)  # Enable disconnect when connected
-            self.reconnect_button.setEnabled(False)  # Disable reconnect when already connected
+            self.status_bar.update_processing_status(
+                f"Connected to server: {self.server_host}:{self.server_port}"
+            )
+            # Stream is (re)started by handle_settings() (V1) /
+            # _v2_on_capabilities() (V2); don't start it here (double-start
+            # inflates the FPS counter).
+            self._user_wants_connected = True
+            self._refresh_connection_button()
         elif status == "disconnected":
+            # A drop. If the user still wants to be connected, the client
+            # thread is auto-retrying in the background — keep the toggle on
+            # "Disconnect" and just reflect the transient state. We only fall
+            # back to the "Connect" state on an explicit disconnect or when
+            # the client gives up (see handle_connection_error).
             self.server_connected = False
             self.status_bar.update_connection_status(False)
-            # Update button states
-            self.connect_button.setEnabled(True)
-            self.disconnect_button.setEnabled(False)
-            self.reconnect_button.setEnabled(True)  # Enable reconnect when disconnected
-            # Clear the server info from status bar
-            if self.camera_running:
+            self.processed_display.stop_stream()
+            if self.curation_auto_timer.isActive():
+                self.curation_auto_timer.stop()
+                if hasattr(self, 'toggle_auto_curation_button'):
+                    self.toggle_auto_curation_button.setText("Start Auto Curation Updates")
+            self._refresh_connection_button()
+            if self._user_wants_connected:
+                self.status_bar.update_processing_status(
+                    f"Connection lost — reconnecting to {self.server_host}:{self.server_port}..."
+                )
+            elif self.camera_running:
                 self.status_bar.update_processing_status("Camera running (not streaming - disconnected)")
             else:
                 self.status_bar.update_processing_status("Disconnected from server")
-            # Stop the stream when disconnected
-            self.processed_display.stop_stream()
-            # Stop automatic curation update timer
-            if self.curation_auto_timer.isActive():
-                print("[UI] Stopping automatic curation update timer due to disconnection")
-                self.curation_auto_timer.stop()
-                # Update button text to reflect inactive state
-                if hasattr(self, 'toggle_auto_curation_button'):
-                    self.toggle_auto_curation_button.setText("Start Auto Curation Updates")
         elif status == "ready":
-            # This status comes when camera streaming is stopped on server side
+            # Emitted when camera streaming is stopped on the server side.
             if self.camera_running and self.server_connected:
                 self.status_bar.update_processing_status(f"Connected to server: {self.server_host}:{self.server_port}")
             elif self.camera_running:
                 self.status_bar.update_processing_status("Camera running (not streaming - disconnected)")
         elif status == "Connection failed after maximum retries":
-            self.server_connected = False
-            self.status_bar.update_connection_status(False)
-            self.status_bar.update_processing_status("Connection failed - click Connect or Reconnect to retry")
-            # Ensure buttons are in correct state when connection fails
-            self.connect_button.setEnabled(True)
-            self.disconnect_button.setEnabled(False)
-            self.reconnect_button.setEnabled(True)  # Enable reconnect when connection fails
+            self._on_connection_terminated("Connection failed - click Connect to retry")
 
     def handle_camera_frame(self, frame):
         """Handle new frame from camera"""
@@ -914,6 +928,72 @@ class MainWindow(QMainWindow):
                 {"input_params": {"properties": controls}}
             )
         self.control_panel.apply_capabilities(caps)
+        # Re-apply the client's last live-knob values so a reconnect resumes
+        # where the session left off instead of snapping back to defaults.
+        self._v2_restore_knobs(set(caps.get("live_adjustable", [])))
+        # Same for the last-loaded LoRA pair (deferred Load, not a live knob).
+        self._v2_restore_lora()
+
+    def _v2_remember_knob(self, field, value):
+        """Track the latest value of each live knob (see _v2_restore_knobs)."""
+        self._knob_values[field] = value
+
+    def _v2_remember_lora(self, slug_a, slug_b, weight_a, weight_b):
+        """Remember the last LoRA pair the user loaded (see _v2_restore_lora)."""
+        self._lora_selection = (slug_a, slug_b, float(weight_a), float(weight_b))
+
+    def _v2_restore_lora(self):
+        """Re-apply the client's last LoRA selection after a (re)connect.
+
+        Restores the A/B dropdowns + fuse weights and re-fires the swap on
+        the server, because a reconnect rebuilds the session at the preset's
+        default LoRA. Heavy — a swap stalls the server a few seconds — so it
+        only fires when the user actually loaded a pair this session AND both
+        slugs still exist in the rebuilt dropdowns (e.g. not after a preset
+        switch). No-op on first connect (nothing remembered yet).
+        """
+        if not self._lora_selection:
+            return
+        slug_a, slug_b, weight_a, weight_b = self._lora_selection
+        if not self.control_panel.set_lora_selection(slug_a, slug_b, weight_a, weight_b):
+            print(
+                f"[UI/V2] Skipping LoRA restore — slug(s) not in rebuilt list: "
+                f"{slug_a!r}, {slug_b!r}"
+            )
+            return
+        if getattr(self, "ws_client_v2", None) is not None:
+            self.ws_client_v2.swap_lora(slug_a, slug_b, weight_a, weight_b)
+            print(
+                f"[UI/V2] Restored LoRA after reconnect: {slug_a} + {slug_b} "
+                f"(w_a={weight_a}, w_b={weight_b})"
+            )
+
+    def _v2_restore_knobs(self, live_fields: set):
+        """Replay the client's last live-knob values after a (re)connect.
+
+        The control panel is rebuilt from the server's advertised defaults on
+        every handshake, which would otherwise wipe adjustments made during
+        the session. We replay the remembered live values — updating both the
+        widget and the server — so reconnecting resumes where the session left
+        off. Only fields that still exist and are live-adjustable under the new
+        capabilities are restored (stale or frozen fields are skipped).
+        """
+        if not self._knob_values:
+            return
+        restored = []
+        # Snapshot: update_control() re-enters _v2_remember_knob via the
+        # widget's own signal in the live window, mutating _knob_values.
+        for field, value in list(self._knob_values.items()):
+            if field not in self.control_panel.controls:
+                continue
+            if live_fields and field not in live_fields:
+                continue
+            self.control_panel.update_control(field, value)   # reflect in the UI
+            if getattr(self, "ws_client_v2", None) is not None:
+                self.ws_client_v2.update_knob(field, value)    # and push to the server
+            restored.append(field)
+        if restored:
+            print(f"[UI/V2] Restored {len(restored)} client knob(s) after reconnect: {restored}")
 
     def _v2_handle_pcm_chunk(self, pcm_bytes: bytes):
         """Stash the most recent PCM chunk for the next camera frame."""
@@ -1022,9 +1102,8 @@ class MainWindow(QMainWindow):
         handle_settings() that aren't already covered by
         ControlPanel.apply_capabilities."""
         self.server_connected = True
-        self.connect_button.setEnabled(False)
-        self.disconnect_button.setEnabled(True)
-        self.reconnect_button.setEnabled(False)
+        self._user_wants_connected = True
+        self._refresh_connection_button()
         self.status_bar.update_processing_status(
             f"V2 connected: {self.server_host}:{self.server_port}"
         )
@@ -1115,143 +1194,39 @@ class MainWindow(QMainWindow):
             self.processing_frame = False
 
     def handle_connection_error(self, error_msg: str):
-        """Handle connection errors"""
+        """Handle connection errors (transient retry failures and terminal)."""
         self.server_connected = False
-        self.status_bar.update_processing_status(f"Error: {error_msg}")
         self.status_bar.update_connection_status(False)
-        
-        # Update button states
-        self.connect_button.setEnabled(True)
-        self.disconnect_button.setEnabled(False)
-        self.reconnect_button.setEnabled(True)  # Enable reconnect after connection error
-        
-        # Update status message based on camera state
-        if self.camera_running:
+
+        # Terminal: the client exhausted its retries and its thread has
+        # stopped. Return to the disconnected state so the toggle reads
+        # "Connect". Every other error is transient — the client is still
+        # retrying — so keep the toggle on "Disconnect".
+        if error_msg == "Connection failed after maximum retries":
+            self._on_connection_terminated("Connection failed - click Connect to retry")
+            return
+
+        self._refresh_connection_button()
+        if self._user_wants_connected:
+            self.status_bar.update_processing_status(f"Connection error (retrying): {error_msg}")
+        elif self.camera_running:
             self.status_bar.update_processing_status("Camera running (not streaming - connection error)")
         else:
             self.status_bar.update_processing_status(f"Connection error: {error_msg}")
 
     def reconnect_to_server(self):
-        """Reconnect to server by completely recreating all network components"""
-        print("[UI] Manual reconnection initiated...")
-        self.status_bar.update_processing_status("Reconnecting to server...")
-        # Disable all connection buttons during reconnection
-        self.reconnect_button.setEnabled(False)
-        self.connect_button.setEnabled(False)
-        self.disconnect_button.setEnabled(False)
-        
-        # Add aggressive cleanup before reconnection to prevent resource accumulation
-        self._perform_aggressive_cleanup_before_reconnection()
-        
-        # Store camera state to restore later
-        was_camera_running = self.camera_running
-        
-        try:
-            # Phase 1: Complete shutdown of all network components
-            print("[UI] Phase 1: Shutting down all network components...")
-            
-            # Stop frame processing immediately
-            self.frame_timer.stop()
-            self.processing_frame = False
-            
-            # Update connection state immediately
-            self.server_connected = False
-            self.status_bar.update_connection_status(False)
-            
-            # Stop and cleanup processed display completely
-            print("[UI] Stopping processed display...")
-            self.processed_display.clear_zmq_queue()
-            self.processed_display.stop_stream()
-            self.processed_display.clear_display()
-            
-            # Stop and recreate WebSocket client completely
-            print("[UI] Stopping WebSocket client...")
-            if hasattr(self, 'ws_client') and self.ws_client is not None:
-                # Force stop the WebSocket client
-                self.ws_client.running = False
-                self.ws_client.processing = False
-                self.ws_client.close()
-                # Give it a moment to stop
-                if self.ws_client.isRunning():
-                    self.ws_client.terminate()
-                    self.ws_client.wait(500)  # Wait up to 500ms
-                
-                # Disconnect all signals to prevent issues
-                try:
-                    self.ws_client.frame_received.disconnect()
-                    self.ws_client.connection_error.disconnect()
-                    self.ws_client.settings_received.disconnect()
-                    self.ws_client.status_changed.disconnect()
-                except:
-                    pass  # Ignore if signals weren't connected
-            
-            print("[UI] Phase 1 complete - all components stopped")
-            
-            # Phase 2: Recreate all components from scratch
-            def recreate_components():
-                try:
-                    print("[UI] Phase 2: Recreating all network components...")
-                    
-                    # Import the WebSocket client class
-                    from clients import WebSocketClient
-                    
-                    # Create completely new WebSocket client
-                    print("[UI] Creating new WebSocket client...")
-                    self.ws_client = WebSocketClient(uri=self.server_ws_uri, max_retries=10, initial_retry_delay=1.0)
-                    
-                    # Connect signals for the new client (ensuring fresh connections)
-                    self.ws_client.frame_received.connect(self.processed_display.update_frame)
-                    self.ws_client.connection_error.connect(self.handle_connection_error)
-                    self.ws_client.settings_received.connect(self.handle_settings)
-                    self.ws_client.status_changed.connect(self.handle_status_change)
-                    self.ws_client.param_updated.connect(self.handle_param_update)
-                    self.signal_connections_active = True
-                    
-                    # Reset FPS counter for fresh start
-                    if hasattr(self, 'status_bar') and hasattr(self.status_bar, 'frame_times'):
-                        self.status_bar.frame_times = []
-                    
-                    print("[UI] New WebSocket client created and connected")
-                    
-                    # Update status
-                    if was_camera_running:
-                        self.status_bar.update_processing_status("Camera running (not streaming - reconnecting)")
-                    else:
-                        self.status_bar.update_processing_status("Reconnecting to server...")
-                    
-                    # Phase 3: Start the connection process
-                    def start_connection():
-                        try:
-                            print("[UI] Phase 3: Starting connection process...")
-                            print(f"[UI] Server URI: {self.server_ws_uri}")
-                            print(f"[UI] WebSocket client user_id: {self.ws_client.user_id}")
-                            self.get_initial_settings()
-                            print("[UI] Reconnection process initiated successfully")
-                        except Exception as e:
-                            print(f"[UI] Error starting connection: {e}")
-                            self.status_bar.update_processing_status(f"Reconnection failed: {e}")
-                            self._update_button_states_after_reconnect()
-                    
-                    # Start connection with a small delay
-                    QTimer.singleShot(200, start_connection)
-                    
-                except Exception as e:
-                    print(f"[UI] Error recreating components: {e}")
-                    self.status_bar.update_processing_status(f"Reconnection failed: {e}")
-                    self._update_button_states_after_reconnect()
-            
-            # Start recreation process with a small delay to ensure cleanup is complete
-            QTimer.singleShot(300, recreate_components)
-            
-        except Exception as e:
-            print(f"[UI] Error during reconnection: {e}")
-            self.status_bar.update_processing_status(f"Reconnection failed: {e}")
-            self.server_connected = False
-            # Re-enable buttons on error
-            QTimer.singleShot(1000, lambda: self._update_button_states_after_reconnect())
-        
-        # Fallback: Re-enable buttons after reasonable time regardless
-        QTimer.singleShot(10000, lambda: self._update_button_states_after_reconnect())
+        """Reconnect = connect again.
+
+        Kept as a named entry point for the curation-update flow
+        (FORCE_MANUAL_RECONNECTION_AFTER_CURATION_UPDATE and the post-update
+        connection-health check still call this). connect_to_server() stops
+        any running client before starting, so reconnect and first-connect
+        run the identical path — no bespoke teardown/recreate dance, and it
+        targets the active protocol's client (V2 by default) rather than
+        only the legacy one.
+        """
+        print("[UI] Reconnect requested")
+        self.connect_to_server()
 
     def _restart_streaming_components(self):
         """Restart all streaming components for reconnection"""
@@ -1276,26 +1251,6 @@ class MainWindow(QMainWindow):
             print("[UI] Fresh frame timer created and started")
         
         print("[UI] Streaming components restart completed")
-
-    def _update_button_states_after_reconnect(self):
-        """Update button states after reconnection attempt"""
-        try:
-            if self.server_connected:
-                self.connect_button.setEnabled(False)  # Disable connect when connected
-                self.disconnect_button.setEnabled(True)  # Enable disconnect when connected
-                self.reconnect_button.setEnabled(False)  # Disable reconnect when connected
-                print("[UI] Reconnection successful - only disconnect button enabled")
-            else:
-                self.connect_button.setEnabled(True)  # Enable connect when disconnected
-                self.disconnect_button.setEnabled(False)  # Disable disconnect when disconnected
-                self.reconnect_button.setEnabled(True)  # Enable reconnect when disconnected
-                print("[UI] Reconnection failed - connect and reconnect buttons enabled")
-        except Exception as e:
-            print(f"[UI] Error updating button states after reconnect: {e}")
-            # Fallback: enable connect and reconnect buttons when disconnected
-            self.connect_button.setEnabled(True)
-            self.disconnect_button.setEnabled(False)
-            self.reconnect_button.setEnabled(True)
 
     def _stop_all_threads(self):
         """Stop all active threads cleanly"""
@@ -1394,9 +1349,8 @@ class MainWindow(QMainWindow):
         
         # Reset UI button states for disconnected state
         self.start_button.setText("Start Camera")
-        self.connect_button.setEnabled(True)  # Enable connect when disconnected
-        self.disconnect_button.setEnabled(False)  # Disable disconnect when disconnected
-        self.reconnect_button.setEnabled(True)  # Enable reconnect when disconnected
+        self._user_wants_connected = False
+        self._refresh_connection_button()
         self.stt_active = False
         if self.stt_button is not None:
             self.stt_button.setText("Start Speech Recognition")
@@ -1703,7 +1657,17 @@ class MainWindow(QMainWindow):
                 self.ws_client.processing = False
                 self.ws_client.close()
                 threads_to_terminate.append(('WebSocket', self.ws_client))
-            
+
+            # V2 realtime client + its raw-PCM audio thread (these used to
+            # leak on close — only the legacy client was being stopped).
+            if hasattr(self, 'ws_client_v2') and self.ws_client_v2 is not None:
+                self.ws_client_v2.close()
+                threads_to_terminate.append(('WSClientV2', self.ws_client_v2))
+
+            if hasattr(self, 'audio_thread') and self.audio_thread is not None:
+                self.audio_thread.stop()
+                threads_to_terminate.append(('Audio', self.audio_thread))
+
             if hasattr(self, 'stt_thread') and self.stt_thread is not None:
                 self.stt_thread.stop()
                 threads_to_terminate.append(('STT', self.stt_thread))
