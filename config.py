@@ -8,7 +8,7 @@ import os
 DISPLAY_WIDTH = 1024
 DISPLAY_HEIGHT = 768
 DISPLAY_SCALE = 1.0
-CAMERA_DEVICE_INDEX = 4 #0 #42
+CAMERA_DEVICE_INDEX = 0 #0 #42
 # None = system default input device. A hardcoded 0 is often NOT a capture
 # device (→ PortAudio -9998 invalid-channel-count). Set to a specific input
 # index from `python -m sounddevice` if you want a particular mic.
