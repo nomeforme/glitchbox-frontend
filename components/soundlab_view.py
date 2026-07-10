@@ -133,6 +133,7 @@ class _LaneChart(QWidget):
     # (key, color, model-tag, composable)
     LANES = [
         ("r",      QColor("#ffffff"), "mix",      False),
+        ("events", QColor("#93a3bd"), "p1",       False),
         ("beat",   QColor("#ff7f5f"), "beatnet",  True),
         ("down",   QColor("#ff4f9f"), "beatnet",  True),
         ("onset",  QColor("#ffb75f"), "dsp",      True),
@@ -148,6 +149,7 @@ class _LaneChart(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.hist = deque(maxlen=20 * 150)   # dicts keyed by lane name
+        self.events = deque(maxlen=300)      # P1 events for the overlay
         # composer state: enabled + weight per composable signal
         self.enabled = {k: k in ("beat", "bass") for k in self.COMPOSABLE}
         self.weights = {k: 0.5 for k in self.COMPOSABLE}
@@ -221,10 +223,16 @@ class _LaneChart(QWidget):
         t1 = self.hist[-1]["t"]
         t0 = t1 - 60.0                       # 60 s window, denser than tab 1
         frames = [f for f in self.hist if f["t"] >= t0]
+        headers = []          # deferred: drawn LAST so nothing covers them
+
+        # ---- pass 1: lane series --------------------------------------
         for li, (key, col, model, composable) in enumerate(self.LANES):
             y0 = li * lane_h
             p.setPen(QPen(COL_GRID, 1))
             p.drawLine(0, int(y0 + lane_h - 1), w, int(y0 + lane_h - 1))
+            if key == "events":
+                headers.append((y0, col, "events [p1]"))
+                continue
             vals = [f[key] for f in frames
                     if f[key] is not None and math.isfinite(f[key])]
             vmax = max(max(vals), 1e-6) if vals else 1.0
@@ -287,12 +295,40 @@ class _LaneChart(QWidget):
             cur = fl.get(key)
             if cur is not None and math.isfinite(cur):
                 label += f"   u:{cur:.4g}  n:{min(cur / norm, 1.0):.2f}"
-            # semi-opaque backdrop so the header reads over the line
-            fm = p.fontMetrics()
+            headers.append((y0, col, label))
+
+        # ---- pass 2: event markers overlaid across ALL lanes ----------
+        ev_lane_i = next(i for i, l in enumerate(self.LANES)
+                         if l[0] == "events")
+        ey0 = ev_lane_i * lane_h
+        fm = p.fontMetrics()
+        visible = [e for e in self.events if e.get("t", -1) >= t0]
+        for e in visible:                       # oldest first: lines
+            x = int((e["t"] - t0) / 60.0 * w)
+            ecol = EVENT_COLORS.get(e.get("kind", ""), COL_EVENT_DEFAULT)
+            pen = QPen(ecol, 1, Qt.DashLine)
+            p.setPen(pen)
+            p.drawLine(x, 0, x, h)
+        for e in visible:                       # newest LAST = on top
+            x = int((e["t"] - t0) / 60.0 * w)
+            ecol = EVENT_COLORS.get(e.get("kind", ""), COL_EVENT_DEFAULT)
+            txt = e.get("kind", "") + (
+                f":{e['band']}" if e.get("band") else "")
+            if e.get("lane") == "stem":
+                txt += "*"
+            tw = fm.horizontalAdvance(txt)
             bg = QColor(COL_BG)
-            bg.setAlpha(185)
+            bg.setAlpha(200)
+            p.fillRect(x + 2, int(ey0 + lane_h / 2 - 6), tw + 6, 13, bg)
+            p.setPen(ecol)
+            p.drawText(x + 5, int(ey0 + lane_h / 2 + 5), txt)
+
+        # ---- pass 3: headers last, full color ALWAYS (readability) ----
+        bg = QColor(COL_BG)
+        bg.setAlpha(190)
+        for y0, col, label in headers:
             p.fillRect(3, int(y0 + 2), fm.horizontalAdvance(label) + 8, 13, bg)
-            p.setPen(dim if disabled else col)
+            p.setPen(col)
             p.drawText(6, int(y0 + 13), label)
 
 
@@ -428,6 +464,7 @@ class SoundlabView(QWidget):
         self.lanes.push(sl)
         for e in sl.get("events") or []:
             self.chart.events.append(e)
+            self.lanes.events.append(e)
             lane = " (stem)" if e.get("lane") == "stem" else ""
             band = f":{e['band']}" if e.get("band") else ""
             self.event_log.appendPlainText(
