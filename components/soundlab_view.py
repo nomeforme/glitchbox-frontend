@@ -17,7 +17,7 @@ from collections import deque
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (QHBoxLayout, QLabel, QPlainTextEdit,
-                               QSlider, QVBoxLayout, QWidget)
+                               QSlider, QTabWidget, QVBoxLayout, QWidget)
 
 SPAN_S = 120.0          # visible history window
 MAX_FRAMES = 20 * 150   # ring capacity (~150 s at 20 fps)
@@ -109,6 +109,80 @@ class _Chart(QWidget):
         p.end()
 
 
+class _LaneChart(QWidget):
+    """Decomposition tab: stacked per-signal lanes (trail style) —
+    beat stroke + onsets, vocal pitch register, and the four stem
+    levels (drums/bass/other/vocals). Each lane self-normalizes to its
+    rolling max so mic level doesn't matter."""
+
+    LANES = [
+        ("beat",   QColor("#ff7f5f")),
+        ("onset",  QColor("#ffb75f")),
+        ("pitch",  QColor("#7fd4ff")),
+        ("drums",  QColor("#ff5f7f")),
+        ("bass",   QColor("#e0e05f")),
+        ("other",  QColor("#5fe08f")),
+        ("vocals", QColor("#b48cff")),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.hist = deque(maxlen=20 * 150)   # dicts keyed by lane name
+        self.setMinimumHeight(300)
+
+    def push(self, sl: dict) -> None:
+        stems = sl.get("stems") or [0, 0, 0, 0]
+        self.hist.append({
+            "t": float(sl.get("t", 0.0)),
+            "beat": float(sl.get("contour", 0.5)),
+            "onset": float(sl.get("onset", 0.0)),
+            "pitch": (float(sl.get("pitch_reg", 0.5))
+                      if float(sl.get("voiced", 0)) > 0.15 else None),
+            "drums": float(stems[0]), "bass": float(stems[1]),
+            "other": float(stems[2]), "vocals": float(stems[3]),
+            "bpm": sl.get("bpm", 0), "conf": sl.get("beat_conf", 0),
+        })
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.fillRect(self.rect(), COL_BG)
+        if len(self.hist) < 4:
+            p.setPen(COL_TEXT)
+            p.drawText(self.rect(), Qt.AlignCenter, "waiting…")
+            return
+        w, h = self.width(), self.height()
+        n = len(self.LANES)
+        lane_h = h / n
+        t1 = self.hist[-1]["t"]
+        t0 = t1 - 60.0                       # 60 s window, denser than tab 1
+        frames = [f for f in self.hist if f["t"] >= t0]
+        for li, (key, col) in enumerate(self.LANES):
+            y0 = li * lane_h
+            p.setPen(QPen(COL_GRID, 1))
+            p.drawLine(0, int(y0 + lane_h - 1), w, int(y0 + lane_h - 1))
+            vals = [f[key] for f in frames if f[key] is not None]
+            vmax = max(max(vals), 1e-6) if vals else 1.0
+            norm = (1.0 if key in ("beat", "pitch") else vmax)
+            p.setPen(QPen(col, 1.4))
+            prev = None
+            for f in frames:
+                v = f[key]
+                if v is None:
+                    prev = None
+                    continue
+                x = (f["t"] - t0) / 60.0 * w
+                y = y0 + lane_h - 4 - (min(v / norm, 1.0)) * (lane_h - 10)
+                if prev is not None:
+                    p.drawLine(int(prev[0]), int(prev[1]), int(x), int(y))
+                prev = (x, y)
+            p.setPen(col)
+            label = key
+            if key == "beat":
+                label = f"beat  {frames[-1]['bpm']:.0f}bpm conf {frames[-1]['conf']:.2f}"
+            p.drawText(6, int(y0 + 13), label)
+        p.end()
+
+
 class SoundlabView(QWidget):
     """Top-level Sound Lab window. Feed it each telemetry sub-dict via
     ``update_telemetry``; it repaints on a fixed timer.
@@ -144,7 +218,14 @@ class SoundlabView(QWidget):
         layout.addLayout(hdr)
 
         self.chart = _Chart()
-        layout.addWidget(self.chart, stretch=1)
+        self.lanes = _LaneChart()
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet(
+            "QTabBar::tab{background:#181c26;color:#8090a8;padding:5px 14px;}"
+            "QTabBar::tab:selected{background:#232838;color:#cfd6e4;}")
+        self.tabs.addTab(self.chart, "signal")
+        self.tabs.addTab(self.lanes, "decomposition")
+        layout.addWidget(self.tabs, stretch=1)
 
         # manual lever — big target, fine steps, fires on every move
         lever_row = QHBoxLayout()
@@ -179,8 +260,11 @@ class SoundlabView(QWidget):
         layout.addWidget(self.event_log)
 
         self._timer = QTimer(self)
-        self._timer.timeout.connect(self.chart.update)
+        self._timer.timeout.connect(self._repaint_active)
         self._timer.start(80)   # ~12 Hz repaint
+
+    def _repaint_active(self):
+        (self.chart if self.tabs.currentIndex() == 0 else self.lanes).update()
 
     def update_telemetry(self, sl: dict) -> None:
         """Slot for WSClient.soundlab_updated (one dict per frame)."""
@@ -195,6 +279,7 @@ class SoundlabView(QWidget):
         except (TypeError, ValueError):
             return
         self.chart.frames.append(frame)
+        self.lanes.push(sl)
         for e in sl.get("events") or []:
             self.chart.events.append(e)
             lane = " (stem)" if e.get("lane") == "stem" else ""
