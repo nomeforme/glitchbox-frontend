@@ -59,6 +59,10 @@ class WSClient(QThread):
     # ----- Qt signals -----
     capabilities_received = Signal(dict)        # server's session_ready ack
     alpha_updated = Signal(float, float, float, float)  # alpha, w_a, w_b, level
+    # Per-frame soundlab policy telemetry (server audio_alpha_mode=
+    # "policy"): the raw "soundlab" sub-dict — contour/state/theme/
+    # staging/events. Rendered by components/soundlab_view.py.
+    soundlab_updated = Signal(dict)
     # Read-only prompt-travel context from the per-frame telemetry:
     # (from_a, from_b, to_a, to_b) — the four bilinear prompt corners.
     prompt_context_updated = Signal(str, str, str, str)
@@ -346,6 +350,9 @@ class WSClient(QThread):
                             str(p.get("from_a", "")), str(p.get("from_b", "")),
                             str(p.get("to_a", "")), str(p.get("to_b", "")),
                         )
+                    sl = data.get("soundlab")
+                    if isinstance(sl, dict):
+                        self.soundlab_updated.emit(sl)
                 elif t == "send_frame":
                     # Server gating us to ship the next frame. The UI
                     # thread holds the most recent camera frame in a

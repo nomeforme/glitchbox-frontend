@@ -392,6 +392,14 @@ class MainWindow(QMainWindow):
         self.fft_button.clicked.connect(self.toggle_fft)
         buttons_layout.addWidget(self.fft_button)
 
+        # Sound Lab window (server policy-mode telemetry visualizer).
+        # Built lazily on first click; telemetry only flows when the
+        # server session runs audio_alpha_mode="policy".
+        self.soundlab_view = None
+        self.soundlab_button = QPushButton("Sound Lab")
+        self.soundlab_button.clicked.connect(self.toggle_soundlab)
+        buttons_layout.addWidget(self.soundlab_button)
+
         # NOTE: ProjectionMapper has its own toggle button inside
         # ProcessedDisplay ("Projection Mapper" button, see
         # components/processed_display.py:222). Frames are routed to the
@@ -538,6 +546,10 @@ class MainWindow(QMainWindow):
             self.ws_client_v2.prompt_context_updated.connect(
                 self._v2_on_prompt_context
             )
+            # Soundlab policy telemetry → Sound Lab window (history
+            # accumulates even while the window is hidden, so opening it
+            # mid-set shows the recent past, not a blank chart).
+            self.ws_client_v2.soundlab_updated.connect(self._v2_handle_soundlab)
             # Live-knob updates flow control_panel → ws_client_v2.update_knob
             self.control_panel.knob_changed.connect(self.ws_client_v2.update_knob)
             # LoRA hot-swap (Load button) → ws_client_v2.swap_lora
@@ -1402,6 +1414,27 @@ class MainWindow(QMainWindow):
             # Recreate the STT thread for next use (QThread cannot be restarted)
             self.stt_thread = SpeechToTextThread(input_device_index=self.audio_device_index)
             self.stt_thread.transcription_updated.connect(self.handle_transcription)
+
+    def _ensure_soundlab_view(self):
+        """Create the Sound Lab window on demand (hidden until toggled)."""
+        if self.soundlab_view is None:
+            from components.soundlab_view import SoundlabView
+            self.soundlab_view = SoundlabView()
+        return self.soundlab_view
+
+    def _v2_handle_soundlab(self, sl: dict):
+        """Per-frame soundlab telemetry → Sound Lab window (built lazily;
+        accumulates history even while hidden)."""
+        self._ensure_soundlab_view().update_telemetry(sl)
+
+    def toggle_soundlab(self):
+        """Show/hide the Sound Lab policy visualizer window."""
+        view = self._ensure_soundlab_view()
+        if view.isVisible():
+            view.hide()
+        else:
+            view.show()
+            view.raise_()
 
     def toggle_fft(self):
         """Toggle FFT audio analysis"""
