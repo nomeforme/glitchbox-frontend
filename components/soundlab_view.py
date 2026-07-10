@@ -12,6 +12,7 @@ Pure QPainter — no plotting dependencies. The window is passive: it
 visualizes; all control stays with the server config / control panel.
 """
 
+import math
 from collections import deque
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -45,6 +46,14 @@ class _Chart(QWidget):
 
     def paintEvent(self, _):
         p = QPainter(self)
+        try:
+            self._paint(p)
+        except Exception:
+            pass       # never let a bad frame kill the app
+        finally:
+            p.end()
+
+    def _paint(self, p):
         p.fillRect(self.rect(), COL_BG)
         w, h = self.width(), self.height()
         if len(self.frames) < 2:
@@ -101,12 +110,14 @@ class _Chart(QWidget):
                     v = f["lo"] + f["contour"] * (f["hi"] - f["lo"])
                 else:
                     v = f["alpha"]
+                if not math.isfinite(v):
+                    prev = None
+                    continue
                 pt = (X(f["t"]), Y(v))
                 if prev is not None:
                     p.drawLine(int(prev[0]), int(prev[1]),
                                int(pt[0]), int(pt[1]))
                 prev = pt
-        p.end()
 
 
 class _LaneChart(QWidget):
@@ -130,21 +141,39 @@ class _LaneChart(QWidget):
         self.hist = deque(maxlen=20 * 150)   # dicts keyed by lane name
         self.setMinimumHeight(300)
 
+    @staticmethod
+    def _num(v, d=0.0):
+        try:
+            v = float(v)
+            return v if math.isfinite(v) else d
+        except (TypeError, ValueError):
+            return d
+
     def push(self, sl: dict) -> None:
         stems = sl.get("stems") or [0, 0, 0, 0]
+        n = self._num
+        voiced = n(sl.get("voiced", 0))
+        pr = n(sl.get("pitch_reg", 0.5), None) if voiced > 0.15 else None
         self.hist.append({
-            "t": float(sl.get("t", 0.0)),
-            "beat": float(sl.get("contour", 0.5)),
-            "onset": float(sl.get("onset", 0.0)),
-            "pitch": (float(sl.get("pitch_reg", 0.5))
-                      if float(sl.get("voiced", 0)) > 0.15 else None),
-            "drums": float(stems[0]), "bass": float(stems[1]),
-            "other": float(stems[2]), "vocals": float(stems[3]),
-            "bpm": sl.get("bpm", 0), "conf": sl.get("beat_conf", 0),
+            "t": n(sl.get("t", 0.0)),
+            "beat": n(sl.get("contour", 0.5), 0.5),
+            "onset": n(sl.get("onset", 0.0)),
+            "pitch": pr,
+            "drums": n(stems[0]), "bass": n(stems[1]),
+            "other": n(stems[2]), "vocals": n(stems[3]),
+            "bpm": n(sl.get("bpm", 0)), "conf": n(sl.get("beat_conf", 0)),
         })
 
     def paintEvent(self, _):
         p = QPainter(self)
+        try:
+            self._paint(p)
+        except Exception:
+            pass       # a bad frame must never take the app down
+        finally:
+            p.end()
+
+    def _paint(self, p):
         p.fillRect(self.rect(), COL_BG)
         if len(self.hist) < 4:
             p.setPen(COL_TEXT)
@@ -160,18 +189,22 @@ class _LaneChart(QWidget):
             y0 = li * lane_h
             p.setPen(QPen(COL_GRID, 1))
             p.drawLine(0, int(y0 + lane_h - 1), w, int(y0 + lane_h - 1))
-            vals = [f[key] for f in frames if f[key] is not None]
+            vals = [f[key] for f in frames
+                    if f[key] is not None and math.isfinite(f[key])]
             vmax = max(max(vals), 1e-6) if vals else 1.0
             norm = (1.0 if key in ("beat", "pitch") else vmax)
             p.setPen(QPen(col, 1.4))
             prev = None
             for f in frames:
                 v = f[key]
-                if v is None:
+                if v is None or not math.isfinite(v):
                     prev = None
                     continue
                 x = (f["t"] - t0) / 60.0 * w
                 y = y0 + lane_h - 4 - (min(v / norm, 1.0)) * (lane_h - 10)
+                if not (math.isfinite(x) and math.isfinite(y)):
+                    prev = None
+                    continue
                 if prev is not None:
                     p.drawLine(int(prev[0]), int(prev[1]), int(x), int(y))
                 prev = (x, y)
@@ -180,7 +213,6 @@ class _LaneChart(QWidget):
             if key == "beat":
                 label = f"beat  {frames[-1]['bpm']:.0f}bpm conf {frames[-1]['conf']:.2f}"
             p.drawText(6, int(y0 + 13), label)
-        p.end()
 
 
 class SoundlabView(QWidget):
@@ -268,16 +300,19 @@ class SoundlabView(QWidget):
 
     def update_telemetry(self, sl: dict) -> None:
         """Slot for WSClient.soundlab_updated (one dict per frame)."""
-        try:
-            frame = {
-                "t": float(sl.get("t", 0.0)),
-                "alpha": float(sl.get("alpha", 0.0)),
-                "contour": float(sl.get("contour", 0.0)),
-                "lo": float(sl.get("lo", 0.0)),
-                "hi": float(sl.get("hi", 1.0)),
-            }
-        except (TypeError, ValueError):
-            return
+        def num(v, d):
+            try:
+                v = float(v)
+                return v if math.isfinite(v) else d
+            except (TypeError, ValueError):
+                return d
+        frame = {
+            "t": num(sl.get("t"), 0.0),
+            "alpha": num(sl.get("alpha"), 0.0),
+            "contour": num(sl.get("contour"), 0.0),
+            "lo": num(sl.get("lo"), 0.0),
+            "hi": num(sl.get("hi"), 1.0),
+        }
         self.chart.frames.append(frame)
         self.lanes.push(sl)
         for e in sl.get("events") or []:
