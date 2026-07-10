@@ -133,7 +133,6 @@ class _LaneChart(QWidget):
     # (key, color, model-tag, composable)
     LANES = [
         ("r",      QColor("#ffffff"), "mix",      False),
-        ("events", QColor("#93a3bd"), "p1",       False),
         ("beat",   QColor("#ff7f5f"), "beatnet",  True),
         ("down",   QColor("#ff4f9f"), "beatnet",  True),
         ("onset",  QColor("#ffb75f"), "dsp",      True),
@@ -143,6 +142,7 @@ class _LaneChart(QWidget):
         ("other",  QColor("#5fe08f"), "htdemucs", True),
         ("vocals", QColor("#b48cff"), "htdemucs", True),
         ("clap",   QColor("#8fdccf"), "clap",     False),
+        ("events", QColor("#93a3bd"), "p1",       False),
     ]
     COMPOSABLE = [k for k, _, _, c in LANES if c]
 
@@ -254,7 +254,7 @@ class _LaneChart(QWidget):
                     prev = None
                     continue
                 if key == "pitch":
-                    live = f.get("voiced_f", 0.0) > 0.05
+                    live = (not disabled) and f.get("voiced_f", 0.0) > 0.05
                     p.setPen(QPen(col if live else dim,
                                   1.8 if live else 1.0))
                 elif key == "r":
