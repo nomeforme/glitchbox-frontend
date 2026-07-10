@@ -165,6 +165,8 @@ class _LaneChart(QWidget):
             "other": n(stems[2]), "vocals": n(stems[3]),
             "bpm": n(sl.get("bpm", 0)), "conf": n(sl.get("beat_conf", 0)),
             "bar": n(sl.get("bar", 0)),
+            "bnet_s": str(sl.get("bnet", "?"))[:26],
+            "pb": str(sl.get("pitch_backend", "?"))[:8],
         })
 
     def paintEvent(self, _):
@@ -225,9 +227,14 @@ class _LaneChart(QWidget):
             p.setPen(col)
             label = key
             if key == "beat":
-                label = f"beat  {frames[-1]['bpm']:.0f}bpm conf {frames[-1]['conf']:.2f}"
+                label = (f"beat  {frames[-1]['bpm']:.0f}bpm "
+                         f"conf {frames[-1]['conf']:.2f} "
+                         f"[{frames[-1].get('bnet_s', '?')}]")
             elif key == "down":
                 label = f"down (bar {frames[-1].get('bar', 0):.1f}s)"
+            elif key == "pitch":
+                label = (f"pitch [{frames[-1].get('pb', '?')}] "
+                         f"voiced {frames[-1].get('voiced_f', 0):.2f}")
             # numeric readout rides just right of the label, same color
             cur = frames[-1][key]
             if cur is not None and math.isfinite(cur):
