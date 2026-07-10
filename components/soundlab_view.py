@@ -153,12 +153,12 @@ class _LaneChart(QWidget):
         stems = sl.get("stems") or [0, 0, 0, 0]
         n = self._num
         voiced = n(sl.get("voiced", 0))
-        pr = n(sl.get("pitch_reg", 0.5), None) if voiced > 0.05 else None
         self.hist.append({
             "t": n(sl.get("t", 0.0)),
             "beat": n(sl.get("contour", 0.5), 0.5),
             "onset": n(sl.get("onset", 0.0)),
-            "pitch": pr,
+            "pitch": n(sl.get("pitch_reg", 0.5), 0.5),
+            "voiced_f": voiced,
             "drums": n(stems[0]), "bass": n(stems[1]),
             "other": n(stems[2]), "vocals": n(stems[3]),
             "bpm": n(sl.get("bpm", 0)), "conf": n(sl.get("beat_conf", 0)),
@@ -193,7 +193,8 @@ class _LaneChart(QWidget):
                     if f[key] is not None and math.isfinite(f[key])]
             vmax = max(max(vals), 1e-6) if vals else 1.0
             norm = (1.0 if key in ("beat", "pitch") else vmax)
-            p.setPen(QPen(col, 1.4))
+            dim = QColor(col)
+            dim.setAlpha(70)
             prev = None
             for f in frames:
                 v = f[key]
@@ -205,11 +206,17 @@ class _LaneChart(QWidget):
                 if not (math.isfinite(x) and math.isfinite(y)):
                     prev = None
                     continue
+                if key == "pitch":
+                    # always draw the register (it steers the mean even
+                    # between phrases) — BRIGHT while a voice is present,
+                    # dim while holding the last value
+                    live = f.get("voiced_f", 0.0) > 0.05
+                    p.setPen(QPen(col if live else dim, 1.8 if live else 1.0))
+                else:
+                    p.setPen(QPen(col, 1.4))
                 if prev is not None:
                     p.drawLine(int(prev[0]), int(prev[1]), int(x), int(y))
                 else:
-                    # isolated sample (sparse voiced pitch): a dot, not
-                    # an invisible zero-length line
                     p.drawEllipse(int(x) - 1, int(y) - 1, 3, 3)
                 prev = (x, y)
             p.setPen(col)
