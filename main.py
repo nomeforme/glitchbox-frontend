@@ -1008,8 +1008,16 @@ class MainWindow(QMainWindow):
             print(f"[UI/V2] Restored {len(restored)} client knob(s) after reconnect: {restored}")
 
     def _v2_handle_pcm_chunk(self, pcm_bytes: bytes):
-        """Stash the most recent PCM chunk for the next camera frame."""
-        self._v2_latest_pcm = pcm_bytes
+        """ACCUMULATE PCM for the next camera frame (soundlab finding:
+        keep-latest dropped half the audio at <20 fps render rates — the
+        server's audio clock ran at 0.5x and every time constant smeared).
+        The server steps its audio chain once per 50 ms sub-chunk, so
+        sending everything keeps the chain on the true clock. Cap ~1 s
+        so a stall can't balloon a frame."""
+        if len(self._v2_latest_pcm) < 88200:   # 1 s @ 44.1 kHz int16
+            self._v2_latest_pcm += pcm_bytes
+        else:
+            self._v2_latest_pcm = pcm_bytes
 
     def _v2_handle_camera_frame(self, frame):
         """Stash the latest camera frame (overwriting older ones).
@@ -1055,6 +1063,7 @@ class MainWindow(QMainWindow):
                 self._v2_grant_held = False
                 self._v2_latest_frame = None
                 self.ws_client_v2.send_frame(jpeg, self._v2_latest_pcm)
+                self._v2_latest_pcm = b""   # accumulator consumed
                 if not getattr(self, "_v2_first_send_logged", False):
                     print("[V2 GATE] first frame shipped via held grant")
                     self._v2_first_send_logged = True
@@ -1093,6 +1102,7 @@ class MainWindow(QMainWindow):
             self._v2_grant_held = False
             try:
                 self.ws_client_v2.send_frame(jpeg, self._v2_latest_pcm)
+                self._v2_latest_pcm = b""   # accumulator consumed
             except Exception as e:
                 print(f"[V2] send_frame (grant) error: {e}")
         else:
