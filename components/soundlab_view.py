@@ -128,6 +128,7 @@ class _LaneChart(QWidget):
 
     LANES = [
         ("beat",   QColor("#ff7f5f")),
+        ("down",   QColor("#ff4f9f")),   # BeatNet downbeats (bar pulses)
         ("onset",  QColor("#ffb75f")),
         ("pitch",  QColor("#7fd4ff")),
         ("drums",  QColor("#ff5f7f")),
@@ -156,12 +157,14 @@ class _LaneChart(QWidget):
         self.hist.append({
             "t": n(sl.get("t", 0.0)),
             "beat": n(sl.get("contour", 0.5), 0.5),
+            "down": n(sl.get("down", 0.0)),
             "onset": n(sl.get("onset", 0.0)),
             "pitch": n(sl.get("pitch_reg", 0.5), 0.5),
             "voiced_f": voiced,
             "drums": n(stems[0]), "bass": n(stems[1]),
             "other": n(stems[2]), "vocals": n(stems[3]),
             "bpm": n(sl.get("bpm", 0)), "conf": n(sl.get("beat_conf", 0)),
+            "bar": n(sl.get("bar", 0)),
         })
 
     def paintEvent(self, _):
@@ -223,6 +226,8 @@ class _LaneChart(QWidget):
             label = key
             if key == "beat":
                 label = f"beat  {frames[-1]['bpm']:.0f}bpm conf {frames[-1]['conf']:.2f}"
+            elif key == "down":
+                label = f"down (bar {frames[-1].get('bar', 0):.1f}s)"
             # numeric readout rides just right of the label, same color
             cur = frames[-1][key]
             if cur is not None and math.isfinite(cur):
