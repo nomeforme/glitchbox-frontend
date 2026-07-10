@@ -17,8 +17,9 @@ from collections import deque
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
-from PySide6.QtWidgets import (QHBoxLayout, QLabel, QPlainTextEdit,
-                               QSlider, QTabWidget, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QDoubleSpinBox, QHBoxLayout,
+                               QLabel, QPlainTextEdit, QSlider, QTabWidget,
+                               QVBoxLayout, QWidget)
 
 SPAN_S = 120.0          # visible history window
 MAX_FRAMES = 20 * 150   # ring capacity (~150 s at 20 fps)
@@ -121,26 +122,38 @@ class _Chart(QWidget):
 
 
 class _LaneChart(QWidget):
-    """Decomposition tab: stacked per-signal lanes (trail style) —
-    beat stroke + onsets, vocal pitch register, and the four stem
-    levels (drums/bass/other/vocals). Each lane self-normalizes to its
-    rolling max so mic level doesn't matter."""
+    """Decomposition tab: stacked per-signal lanes (trail style).
 
+    Top lane `r` is the LINEAR COMPOSER output: r = Σ w_i·s_i over the
+    enabled NORMALIZED signals with Σw_i = 1 (weights renormalized over
+    the enabled set). Display-only for now — it does not drive the deck.
+    A `clap` lane shows the instantaneous semantic verdict for visual
+    alignment against the low-level signals."""
+
+    # (key, color, model-tag, composable)
     LANES = [
-        ("beat",   QColor("#ff7f5f")),
-        ("down",   QColor("#ff4f9f")),   # BeatNet downbeats (bar pulses)
-        ("onset",  QColor("#ffb75f")),
-        ("pitch",  QColor("#7fd4ff")),
-        ("drums",  QColor("#ff5f7f")),
-        ("bass",   QColor("#e0e05f")),
-        ("other",  QColor("#5fe08f")),
-        ("vocals", QColor("#b48cff")),
+        ("r",      QColor("#ffffff"), "mix",      False),
+        ("beat",   QColor("#ff7f5f"), "beatnet",  True),
+        ("down",   QColor("#ff4f9f"), "beatnet",  True),
+        ("onset",  QColor("#ffb75f"), "dsp",      True),
+        ("pitch",  QColor("#7fd4ff"), "pesto",    True),
+        ("drums",  QColor("#ff5f7f"), "htdemucs", True),
+        ("bass",   QColor("#e0e05f"), "htdemucs", True),
+        ("other",  QColor("#5fe08f"), "htdemucs", True),
+        ("vocals", QColor("#b48cff"), "htdemucs", True),
+        ("clap",   QColor("#8fdccf"), "clap",     False),
     ]
+    COMPOSABLE = [k for k, _, _, c in LANES if c]
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.hist = deque(maxlen=20 * 150)   # dicts keyed by lane name
-        self.setMinimumHeight(300)
+        # composer state: enabled + weight per composable signal
+        self.enabled = {k: k in ("beat", "bass") for k in self.COMPOSABLE}
+        self.weights = {k: 0.5 for k in self.COMPOSABLE}
+        # rolling normalization state per signal (for r at push time)
+        self._peak = {k: 1e-6 for k in self.COMPOSABLE}
+        self.setMinimumHeight(340)
 
     @staticmethod
     def _num(v, d=0.0):
@@ -154,7 +167,8 @@ class _LaneChart(QWidget):
         stems = sl.get("stems") or [0, 0, 0, 0]
         n = self._num
         voiced = n(sl.get("voiced", 0))
-        self.hist.append({
+        cn = sl.get("clap_now") or ["", 0.0]
+        f = {
             "t": n(sl.get("t", 0.0)),
             "beat": n(sl.get("contour", 0.5), 0.5),
             "down": n(sl.get("down", 0.0)),
@@ -163,11 +177,28 @@ class _LaneChart(QWidget):
             "voiced_f": voiced,
             "drums": n(stems[0]), "bass": n(stems[1]),
             "other": n(stems[2]), "vocals": n(stems[3]),
+            "clap": n(cn[1] if len(cn) > 1 else 0.0),
+            "clap_l": str(cn[0] if cn else ""),
             "bpm": n(sl.get("bpm", 0)), "conf": n(sl.get("beat_conf", 0)),
             "bar": n(sl.get("bar", 0)),
             "bnet_s": str(sl.get("bnet", "?"))[:26],
             "pb": str(sl.get("pitch_backend", "?"))[:8],
-        })
+        }
+        # composer: r = Σ w_i · s_i(normalized), weights renormalized
+        # over the ENABLED set (Σw = 1); rolling-peak normalization with
+        # slow decay so it adapts without pinning
+        num_ = 0.0
+        den = 0.0
+        for k in self.COMPOSABLE:
+            v = f[k]
+            self._peak[k] = max(v, self._peak[k] * 0.9995, 1e-6)
+            f[k + "_n"] = min(v / self._peak[k], 1.0)
+            if self.enabled.get(k):
+                w = max(0.0, self.weights.get(k, 0.0))
+                num_ += w * f[k + "_n"]
+                den += w
+        f["r"] = (num_ / den) if den > 1e-9 else 0.0
+        self.hist.append(f)
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -190,17 +221,20 @@ class _LaneChart(QWidget):
         t1 = self.hist[-1]["t"]
         t0 = t1 - 60.0                       # 60 s window, denser than tab 1
         frames = [f for f in self.hist if f["t"] >= t0]
-        for li, (key, col) in enumerate(self.LANES):
+        for li, (key, col, model, composable) in enumerate(self.LANES):
             y0 = li * lane_h
             p.setPen(QPen(COL_GRID, 1))
             p.drawLine(0, int(y0 + lane_h - 1), w, int(y0 + lane_h - 1))
             vals = [f[key] for f in frames
                     if f[key] is not None and math.isfinite(f[key])]
             vmax = max(max(vals), 1e-6) if vals else 1.0
-            norm = (1.0 if key in ("beat", "pitch") else vmax)
+            norm = (1.0 if key in ("beat", "pitch", "r", "clap") else vmax)
             dim = QColor(col)
             dim.setAlpha(70)
+            disabled = composable and not self.enabled.get(key)
+            base_pen = QPen(dim if disabled else col, 1.4)
             prev = None
+            last_lbl = None
             for f in frames:
                 v = f[key]
                 if v is None or not math.isfinite(v):
@@ -212,34 +246,53 @@ class _LaneChart(QWidget):
                     prev = None
                     continue
                 if key == "pitch":
-                    # always draw the register (it steers the mean even
-                    # between phrases) — BRIGHT while a voice is present,
-                    # dim while holding the last value
                     live = f.get("voiced_f", 0.0) > 0.05
-                    p.setPen(QPen(col if live else dim, 1.8 if live else 1.0))
+                    p.setPen(QPen(col if live else dim,
+                                  1.8 if live else 1.0))
+                elif key == "r":
+                    p.setPen(QPen(col, 2.2))
                 else:
-                    p.setPen(QPen(col, 1.4))
+                    p.setPen(base_pen)
                 if prev is not None:
                     p.drawLine(int(prev[0]), int(prev[1]), int(x), int(y))
                 else:
                     p.drawEllipse(int(x) - 1, int(y) - 1, 3, 3)
                 prev = (x, y)
-            p.setPen(col)
-            label = key
+                # clap lane: annotate label changes on the timeline
+                if key == "clap":
+                    lbl = f.get("clap_l", "")
+                    if lbl and lbl != last_lbl:
+                        p.setPen(col)
+                        p.drawText(int(x) + 2, int(y0 + lane_h - 6), lbl)
+                        last_lbl = lbl
+
+            # ---- lane header: name [model] u:<raw> n:<norm> -------------
+            fl = frames[-1]
+            label = f"{key} [{model}]"
             if key == "beat":
-                label = (f"beat  {frames[-1]['bpm']:.0f}bpm "
-                         f"conf {frames[-1]['conf']:.2f} "
-                         f"[{frames[-1].get('bnet_s', '?')}]")
+                label += (f" {fl['bpm']:.0f}bpm conf {fl['conf']:.2f} "
+                          f"[{fl.get('bnet_s', '?')}]")
             elif key == "down":
-                label = f"down (bar {frames[-1].get('bar', 0):.1f}s)"
+                label += f" bar {fl.get('bar', 0):.1f}s"
             elif key == "pitch":
-                label = (f"pitch [{frames[-1].get('pb', '?')}] "
-                         f"voiced {frames[-1].get('voiced_f', 0):.2f}")
-            # numeric readout rides just right of the label, same color
-            cur = frames[-1][key]
+                label += f" voiced {fl.get('voiced_f', 0):.2f}"
+            elif key == "r":
+                on = [k for k in self.COMPOSABLE if self.enabled.get(k)]
+                den = sum(max(0.0, self.weights[k]) for k in on) or 1.0
+                label = ("r [mix] = " + " + ".join(
+                    f"{max(0.0, self.weights[k]) / den:.2f}·{k}"
+                    for k in on)) if on else "r [mix] = (nothing enabled)"
+            elif key == "clap":
+                label += f" {fl.get('clap_l', '')}"
+            cur = fl.get(key)
             if cur is not None and math.isfinite(cur):
-                nrm = min(cur / norm, 1.0)
-                label += f"   {cur:.4g}  n:{nrm:.2f}"
+                label += f"   u:{cur:.4g}  n:{min(cur / norm, 1.0):.2f}"
+            # semi-opaque backdrop so the header reads over the line
+            fm = p.fontMetrics()
+            bg = QColor(COL_BG)
+            bg.setAlpha(185)
+            p.fillRect(3, int(y0 + 2), fm.horizontalAdvance(label) + 8, 13, bg)
+            p.setPen(dim if disabled else col)
             p.drawText(6, int(y0 + 13), label)
 
 
@@ -279,12 +332,42 @@ class SoundlabView(QWidget):
 
         self.chart = _Chart()
         self.lanes = _LaneChart()
+        # decomposition tab = lanes + linear-composer controls
+        self.decomp = QWidget()
+        dv = QVBoxLayout(self.decomp)
+        dv.setContentsMargins(0, 0, 0, 0)
+        dv.addWidget(self.lanes, stretch=1)
+        comp_row = QHBoxLayout()
+        comp_lbl = QLabel("r =")
+        comp_lbl.setStyleSheet("color:#8090a8;font-weight:bold;")
+        comp_row.addWidget(comp_lbl)
+        for key in self.lanes.COMPOSABLE:
+            cb = QCheckBox(key)
+            cb.setChecked(self.lanes.enabled[key])
+            cb.toggled.connect(
+                lambda on, k=key: self.lanes.enabled.__setitem__(k, on))
+            sp = QDoubleSpinBox()
+            sp.setRange(0.0, 1.0)
+            sp.setSingleStep(0.05)
+            sp.setDecimals(2)
+            sp.setValue(self.lanes.weights[key])
+            sp.setFixedWidth(60)
+            sp.setStyleSheet("background:#181c26;color:#cfd6e4;")
+            sp.valueChanged.connect(
+                lambda v, k=key: self.lanes.weights.__setitem__(k, v))
+            comp_row.addWidget(cb)
+            comp_row.addWidget(sp)
+        comp_row.addStretch()
+        note = QLabel("weights auto-renormalized to Σ=1 · display-only")
+        note.setStyleSheet("color:#5a677f;font-size:10px;")
+        comp_row.addWidget(note)
+        dv.addLayout(comp_row)
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet(
             "QTabBar::tab{background:#181c26;color:#8090a8;padding:5px 14px;}"
             "QTabBar::tab:selected{background:#232838;color:#cfd6e4;}")
         self.tabs.addTab(self.chart, "signal")
-        self.tabs.addTab(self.lanes, "decomposition")
+        self.tabs.addTab(self.decomp, "decomposition")
         layout.addWidget(self.tabs, stretch=1)
 
         # manual lever — big target, fine steps, fires on every move
