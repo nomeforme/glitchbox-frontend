@@ -1430,6 +1430,12 @@ class MainWindow(QMainWindow):
         if self.soundlab_view is None:
             from components.soundlab_view import SoundlabView
             self.soundlab_view = SoundlabView()
+            # manual lever -> live knob (drives α when mode="manual";
+            # the server auto-logs the human trace + policy prediction)
+            if getattr(self, "ws_client_v2", None) is not None:
+                self.soundlab_view.manual_changed.connect(
+                    lambda v: self.ws_client_v2.update_knob(
+                        "manual_alpha", v))
         return self.soundlab_view
 
     def _v2_handle_soundlab(self, sl: dict):

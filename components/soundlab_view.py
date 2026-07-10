@@ -14,10 +14,10 @@ visualizes; all control stays with the server config / control panel.
 
 from collections import deque
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (QHBoxLayout, QLabel, QPlainTextEdit,
-                               QVBoxLayout, QWidget)
+                               QSlider, QVBoxLayout, QWidget)
 
 SPAN_S = 120.0          # visible history window
 MAX_FRAMES = 20 * 150   # ring capacity (~150 s at 20 fps)
@@ -111,7 +111,14 @@ class _Chart(QWidget):
 
 class SoundlabView(QWidget):
     """Top-level Sound Lab window. Feed it each telemetry sub-dict via
-    ``update_telemetry``; it repaints on a fixed timer."""
+    ``update_telemetry``; it repaints on a fixed timer.
+
+    Manual lever: a big slider under the chart. When the server session
+    runs audio_alpha_mode="manual", this drives the deck (via the
+    ``manual_alpha`` live knob) and the session auto-logs the human trace
+    next to the policy's prediction — the imitation dataset."""
+
+    manual_changed = Signal(float)   # 0..1, wired to update_knob upstream
 
     def __init__(self):
         super().__init__()
@@ -138,6 +145,30 @@ class SoundlabView(QWidget):
 
         self.chart = _Chart()
         layout.addWidget(self.chart, stretch=1)
+
+        # manual lever — big target, fine steps, fires on every move
+        lever_row = QHBoxLayout()
+        lever_label = QLabel("manual α")
+        lever_label.setStyleSheet("color:#8090a8;")
+        lever_row.addWidget(lever_label)
+        self.lever = QSlider(Qt.Horizontal)
+        self.lever.setRange(0, 1000)
+        self.lever.setValue(500)
+        self.lever.setMinimumHeight(36)
+        self.lever.setStyleSheet(
+            "QSlider::groove:horizontal{height:12px;background:#232838;"
+            "border-radius:6px;}"
+            "QSlider::handle:horizontal{width:34px;margin:-10px 0;"
+            "background:#7fd4ff;border-radius:8px;}")
+        self.lever.valueChanged.connect(
+            lambda v: (self.lever_value_label.setText(f"{v / 1000:.3f}"),
+                       self.manual_changed.emit(v / 1000.0)))
+        lever_row.addWidget(self.lever, stretch=1)
+        self.lever_value_label = QLabel("0.500")
+        self.lever_value_label.setStyleSheet(
+            "color:#7fd4ff;font-weight:bold;min-width:48px;")
+        lever_row.addWidget(self.lever_value_label)
+        layout.addLayout(lever_row)
 
         self.event_log = QPlainTextEdit()
         self.event_log.setReadOnly(True)
