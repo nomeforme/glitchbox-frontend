@@ -223,14 +223,12 @@ class _LaneChart(QWidget):
             label = key
             if key == "beat":
                 label = f"beat  {frames[-1]['bpm']:.0f}bpm conf {frames[-1]['conf']:.2f}"
-            p.drawText(6, int(y0 + 13), label)
-            # numeric readout: raw value / normalized value (right edge)
+            # numeric readout rides just right of the label, same color
             cur = frames[-1][key]
             if cur is not None and math.isfinite(cur):
                 nrm = min(cur / norm, 1.0)
-                p.setPen(COL_TEXT)
-                p.drawText(w - 150, int(y0 + 13),
-                           f"{cur:.4g}  n:{nrm:.2f}")
+                label += f"   {cur:.4g}  n:{nrm:.2f}"
+            p.drawText(6, int(y0 + 13), label)
 
 
 class SoundlabView(QWidget):
