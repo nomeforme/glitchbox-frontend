@@ -153,7 +153,7 @@ class _LaneChart(QWidget):
         stems = sl.get("stems") or [0, 0, 0, 0]
         n = self._num
         voiced = n(sl.get("voiced", 0))
-        pr = n(sl.get("pitch_reg", 0.5), None) if voiced > 0.15 else None
+        pr = n(sl.get("pitch_reg", 0.5), None) if voiced > 0.05 else None
         self.hist.append({
             "t": n(sl.get("t", 0.0)),
             "beat": n(sl.get("contour", 0.5), 0.5),
@@ -207,6 +207,10 @@ class _LaneChart(QWidget):
                     continue
                 if prev is not None:
                     p.drawLine(int(prev[0]), int(prev[1]), int(x), int(y))
+                else:
+                    # isolated sample (sparse voiced pitch): a dot, not
+                    # an invisible zero-length line
+                    p.drawEllipse(int(x) - 1, int(y) - 1, 3, 3)
                 prev = (x, y)
             p.setPen(col)
             label = key
