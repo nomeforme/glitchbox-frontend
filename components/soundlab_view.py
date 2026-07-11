@@ -186,20 +186,14 @@ class _LaneChart(QWidget):
             "bnet_s": str(sl.get("bnet", "?"))[:26],
             "pb": str(sl.get("pitch_backend", "?"))[:8],
         }
-        # composer: r = Σ w_i · s_i(normalized), weights renormalized
-        # over the ENABLED set (Σw = 1); rolling-peak normalization with
-        # slow decay so it adapts without pinning
-        num_ = 0.0
-        den = 0.0
+        # per-lane display normalization (rolling peak, slow decay)
         for k in self.COMPOSABLE:
             v = f[k]
             self._peak[k] = max(v, self._peak[k] * 0.9995, 1e-6)
             f[k + "_n"] = min(v / self._peak[k], 1.0)
-            if self.enabled.get(k):
-                w = max(0.0, self.weights.get(k, 0.0))
-                num_ += w * f[k + "_n"]
-                den += w
-        f["r"] = (num_ / den) if den > 1e-9 else 0.0
+        # r = the SERVER-computed deck signal (soundlab_mix drives the
+        # blend now; in manual mode alpha is the lever, policy_alpha=r)
+        f["r"] = n(sl.get("policy_alpha", sl.get("alpha", 0.0)))
         self.hist.append(f)
 
     def paintEvent(self, _):
@@ -287,9 +281,9 @@ class _LaneChart(QWidget):
             elif key == "r":
                 on = [k for k in self.COMPOSABLE if self.enabled.get(k)]
                 den = sum(max(0.0, self.weights[k]) for k in on) or 1.0
-                label = ("r [mix] = " + " + ".join(
+                label = ("r [mix→deck] = " + " + ".join(
                     f"{max(0.0, self.weights[k]) / den:.2f}·{k}"
-                    for k in on)) if on else "r [mix] = (nothing enabled)"
+                    for k in on)) if on else "r [mix→deck] = (nothing enabled)"
             elif key == "clap":
                 label += f" {fl.get('clap_l', '')}"
             cur = fl.get(key)
@@ -342,6 +336,7 @@ class SoundlabView(QWidget):
     next to the policy's prediction — the imitation dataset."""
 
     manual_changed = Signal(float)   # 0..1, wired to update_knob upstream
+    mix_changed = Signal(str)        # "sig:w,..." -> soundlab_mix knob
 
     def __init__(self):
         super().__init__()
@@ -377,11 +372,18 @@ class SoundlabView(QWidget):
         comp_lbl = QLabel("r =")
         comp_lbl.setStyleSheet("color:#8090a8;font-weight:bold;")
         comp_row.addWidget(comp_lbl)
+        def _emit_mix():
+            spec = ",".join(
+                f"{k}:{max(0.0, self.lanes.weights[k]):.2f}"
+                for k in self.lanes.COMPOSABLE if self.lanes.enabled.get(k))
+            self.mix_changed.emit(spec or "beat:0.0")
+
         for key in self.lanes.COMPOSABLE:
             cb = QCheckBox(key)
             cb.setChecked(self.lanes.enabled[key])
             cb.toggled.connect(
-                lambda on, k=key: self.lanes.enabled.__setitem__(k, on))
+                lambda on, k=key: (self.lanes.enabled.__setitem__(k, on),
+                                   _emit_mix()))
             sp = QDoubleSpinBox()
             sp.setRange(0.0, 1.0)
             sp.setSingleStep(0.05)
@@ -390,12 +392,13 @@ class SoundlabView(QWidget):
             sp.setFixedWidth(60)
             sp.setStyleSheet("background:#181c26;color:#cfd6e4;")
             sp.valueChanged.connect(
-                lambda v, k=key: self.lanes.weights.__setitem__(k, v))
+                lambda v, k=key: (self.lanes.weights.__setitem__(k, v),
+                                  _emit_mix()))
             comp_row.addWidget(cb)
             comp_row.addWidget(sp)
         comp_row.addStretch()
-        note = QLabel("weights auto-renormalized to Σ=1 · display-only")
-        note.setStyleSheet("color:#5a677f;font-size:10px;")
+        note = QLabel("weights auto-renormalized to Σ=1 · DRIVES THE DECK")
+        note.setStyleSheet("color:#8fdccf;font-size:10px;font-weight:bold;")
         comp_row.addWidget(note)
         dv.addLayout(comp_row)
         self.tabs = QTabWidget()

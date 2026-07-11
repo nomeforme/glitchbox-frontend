@@ -1436,6 +1436,10 @@ class MainWindow(QMainWindow):
                 self.soundlab_view.manual_changed.connect(
                     lambda v: self.ws_client_v2.update_knob(
                         "manual_alpha", v))
+                # composer mix -> the deck's r-driver (policy mode)
+                self.soundlab_view.mix_changed.connect(
+                    lambda spec: self.ws_client_v2.update_knob(
+                        "soundlab_mix", spec))
         return self.soundlab_view
 
     def _v2_handle_soundlab(self, sl: dict):
