@@ -151,7 +151,7 @@ class _LaneChart(QWidget):
         self.hist = deque(maxlen=20 * 150)   # dicts keyed by lane name
         self.events = deque(maxlen=300)      # P1 events for the overlay
         # composer state: enabled + weight per composable signal
-        self.enabled = {k: k in ("beat", "bass") for k in self.COMPOSABLE}
+        self.enabled = {k: k in ("onset", "down") for k in self.COMPOSABLE}
         self.weights = {k: 0.5 for k in self.COMPOSABLE}
         # rolling normalization state per signal (for r at push time)
         self._peak = {k: 1e-6 for k in self.COMPOSABLE}
