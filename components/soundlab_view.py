@@ -184,6 +184,7 @@ class _LaneChart(QWidget):
             "bpm": n(sl.get("bpm", 0)), "conf": n(sl.get("beat_conf", 0)),
             "bar": n(sl.get("bar", 0)),
             "bnet_s": str(sl.get("bnet", "?"))[:26],
+            "stem_s": str(sl.get("stem", "?"))[:30],
             "pb": str(sl.get("pitch_backend", "?"))[:8],
         }
         # per-lane display normalization (rolling peak, slow decay)
@@ -278,6 +279,8 @@ class _LaneChart(QWidget):
                 label += f" bar {fl.get('bar', 0):.1f}s"
             elif key == "pitch":
                 label += f" voiced {fl.get('voiced_f', 0):.2f}"
+            elif key == "drums":
+                label += f" [{fl.get('stem_s', '?')}]"
             elif key == "r":
                 on = [k for k in self.COMPOSABLE if self.enabled.get(k)]
                 den = sum(max(0.0, self.weights[k]) for k in on) or 1.0
