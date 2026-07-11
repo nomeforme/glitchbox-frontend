@@ -432,6 +432,7 @@ class SoundlabView(QWidget):
 
         self.event_log = QPlainTextEdit()
         self.event_log.setReadOnly(True)
+        self.event_log.setMaximumBlockCount(300)   # unbounded doc = slow Qt
         self.event_log.setMaximumHeight(96)
         self.event_log.setStyleSheet(
             "background:#11141b;border:1px solid #232838;"
