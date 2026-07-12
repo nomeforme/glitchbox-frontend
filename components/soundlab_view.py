@@ -17,9 +17,9 @@ from collections import deque
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
-from PySide6.QtWidgets import (QCheckBox, QDoubleSpinBox, QHBoxLayout,
-                               QLabel, QPlainTextEdit, QSlider, QTabWidget,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
+                               QHBoxLayout, QLabel, QPlainTextEdit, QSlider,
+                               QTabWidget, QVBoxLayout, QWidget)
 
 SPAN_S = 120.0          # visible history window
 MAX_FRAMES = 20 * 150   # ring capacity (~150 s at 20 fps)
@@ -43,7 +43,9 @@ class _Chart(QWidget):
         super().__init__(parent)
         self.frames = deque(maxlen=MAX_FRAMES)   # dicts: t, alpha, contour, lo, hi
         self.events = deque(maxlen=400)          # dicts: t, kind, band, lane
-        self.setMinimumHeight(260)
+        self.setMinimumHeight(200)   # must leave room for the knob +
+                                     # lever rows below (they were being
+                                     # clipped at small window heights)
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -122,17 +124,15 @@ class _Chart(QWidget):
 
 
 class _LaneChart(QWidget):
-    """Decomposition tab: stacked per-signal lanes (trail style).
-
-    Top lane `r` is the LINEAR COMPOSER output: r = Σ w_i·s_i over the
-    enabled NORMALIZED signals with Σw_i = 1 (weights renormalized over
-    the enabled set). Display-only for now — it does not drive the deck.
-    A `clap` lane shows the instantaneous semantic verdict for visual
-    alignment against the low-level signals."""
+    """Decomposition tab: stacked per-signal lanes (trail style) — pure
+    visualization. Composition lives in the GRAPH tab; a lane draws
+    bright when its signal has a source node in the active patch (the
+    server's `norm` dict carries exactly those), dim otherwise. The top
+    `r` lane header renders the ACTIVE deck formula."""
 
     # (key, color, model-tag, composable)
     LANES = [
-        ("r",      QColor("#ffffff"), "mix",      False),
+        ("r",      QColor("#ffffff"), "graph",    False),
         ("beat",   QColor("#ff7f5f"), "beatnet",  True),
         ("down",   QColor("#ff4f9f"), "beatnet",  True),
         ("onset",  QColor("#ffb75f"), "dsp",      True),
@@ -150,11 +150,7 @@ class _LaneChart(QWidget):
         super().__init__(parent)
         self.hist = deque(maxlen=20 * 150)   # dicts keyed by lane name
         self.events = deque(maxlen=300)      # P1 events for the overlay
-        # composer state: enabled + weight per composable signal
-        self.enabled = {k: k in ("onset", "down") for k in self.COMPOSABLE}
-        self.weights = {k: 0.5 for k in self.COMPOSABLE}
-        # rolling normalization state per signal (for r at push time)
-        self._peak = {k: 1e-6 for k in self.COMPOSABLE}
+        self.formula = ""    # active deck formula (server telemetry)
         self.setMinimumHeight(340)
 
     @staticmethod
@@ -183,15 +179,20 @@ class _LaneChart(QWidget):
             "clap_l": str(cn[0] if cn else ""),
             "bpm": n(sl.get("bpm", 0)), "conf": n(sl.get("beat_conf", 0)),
             "bar": n(sl.get("bar", 0)),
+            "dsyn": n(sl.get("down_synth", 0)),
             "bnet_s": str(sl.get("bnet", "?"))[:26],
             "stem_s": str(sl.get("stem", "?"))[:30],
             "pb": str(sl.get("pitch_backend", "?"))[:8],
+            "vox": n(sl.get("vox", 0.0)),
+            "mix_s": str(sl.get("mix", ""))[:20],   # active patch name
         }
-        # per-lane display normalization (rolling peak, slow decay)
+        # server-side normalized signals: EXACTLY what the composer
+        # mixed this frame (floor+peak stretch) — the authoritative
+        # bright line; raw stays as a dim underlay
+        nrm = sl.get("norm") or {}
         for k in self.COMPOSABLE:
-            v = f[k]
-            self._peak[k] = max(v, self._peak[k] * 0.9995, 1e-6)
-            f[k + "_n"] = min(v / self._peak[k], 1.0)
+            sv = nrm.get(k)
+            f[k + "_sn"] = n(sv) if sv is not None else None
         # r = the SERVER-computed deck signal (soundlab_mix drives the
         # blend now; in manual mode alpha is the lever, policy_alpha=r)
         f["r"] = n(sl.get("policy_alpha", sl.get("alpha", 0.0)))
@@ -231,15 +232,45 @@ class _LaneChart(QWidget):
             vals = [f[key] for f in frames
                     if f[key] is not None and math.isfinite(f[key])]
             vmax = max(max(vals), 1e-6) if vals else 1.0
-            norm = (1.0 if key in ("beat", "pitch", "r", "clap") else vmax)
+            raw_norm = (1.0 if key in ("beat", "pitch", "r", "clap")
+                        else vmax)
             dim = QColor(col)
             dim.setAlpha(70)
-            disabled = composable and not self.enabled.get(key)
+            # bright iff the signal has a source node in the ACTIVE
+            # patch (the server's norm dict carries exactly those)
+            in_mix = frames[-1].get(key + "_sn") is not None
+            disabled = composable and not in_mix
             base_pen = QPen(dim if disabled else col, 1.4)
+            # server-normalized series available? bright line = what the
+            # composer mixed; raw drops to a faint underlay
+            sn_key = key + "_sn"
+            use_sn = composable and any(
+                f.get(sn_key) is not None for f in frames[-5:])
+            if use_sn:
+                under = QColor(col)
+                under.setAlpha(45)
+                p.setPen(QPen(under, 1.0))
+                prev = None
+                for f in frames:
+                    v = f[key]
+                    if v is None or not math.isfinite(v):
+                        prev = None
+                        continue
+                    x = (f["t"] - t0) / 60.0 * w
+                    y = (y0 + lane_h - 4
+                         - min(v / raw_norm, 1.0) * (lane_h - 10))
+                    if not (math.isfinite(x) and math.isfinite(y)):
+                        prev = None
+                        continue
+                    if prev is not None:
+                        p.drawLine(int(prev[0]), int(prev[1]),
+                                   int(x), int(y))
+                    prev = (x, y)
+            norm = 1.0 if use_sn else raw_norm
             prev = None
             last_lbl = None
             for f in frames:
-                v = f[key]
+                v = f.get(sn_key) if use_sn else f[key]
                 if v is None or not math.isfinite(v):
                     prev = None
                     continue
@@ -277,21 +308,25 @@ class _LaneChart(QWidget):
                           f"[{fl.get('bnet_s', '?')}]")
             elif key == "down":
                 label += f" bar {fl.get('bar', 0):.1f}s"
+                if fl.get("dsyn", 0) > 0:   # watchdog carrying the PF
+                    label += f" ~synth×{int(fl['dsyn'])}"
             elif key == "pitch":
                 label += f" voiced {fl.get('voiced_f', 0):.2f}"
             elif key == "drums":
                 label += f" [{fl.get('stem_s', '?')}]"
             elif key == "r":
-                on = [k for k in self.COMPOSABLE if self.enabled.get(k)]
-                den = sum(max(0.0, self.weights[k]) for k in on) or 1.0
-                label = ("r [mix→deck] = " + " + ".join(
-                    f"{max(0.0, self.weights[k]) / den:.2f}·{k}"
-                    for k in on)) if on else "r [mix→deck] = (nothing enabled)"
+                # keep it terse — the full formula lives on the graph tab
+                label = (f"r [graph→deck] {fl.get('mix_s', '')} "
+                         f"vox {fl.get('vox', 0):.2f}")
             elif key == "clap":
                 label += f" {fl.get('clap_l', '')}"
             cur = fl.get(key)
             if cur is not None and math.isfinite(cur):
-                label += f"   u:{cur:.4g}  n:{min(cur / norm, 1.0):.2f}"
+                sn = fl.get(sn_key) if use_sn else None
+                if sn is not None and math.isfinite(sn):
+                    label += f"   u:{cur:.4g}  n:{sn:.2f}"
+                else:
+                    label += f"   u:{cur:.4g}  n:{min(cur / norm, 1.0):.2f}"
             headers.append((y0, col, label))
 
         # ---- pass 2: event markers overlaid across ALL lanes ----------
@@ -339,14 +374,30 @@ class SoundlabView(QWidget):
     next to the policy's prediction — the imitation dataset."""
 
     manual_changed = Signal(float)   # 0..1, wired to update_knob upstream
-    mix_changed = Signal(str)        # "sig:w,..." -> soundlab_mix knob
+    knob_changed = Signal(str, object)   # audio-group server knobs
+    # graph_applied (Signal(str), JSON patch -> soundlab_graph knob) is
+    # re-exported from the nodal editor in __init__.
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Sound Lab")
-        self.resize(980, 460)
+        self.resize(1100, 640)   # tall enough that the signal tab's knob
+                                 # + lever rows never clip off the bottom
+        # NOTE: bare declarations and selector rules cannot be mixed in
+        # one QSS sheet (the parser drops the sheet) — that is why the
+        # manual-α checkbox rendered as label-only text (live finding
+        # 2026-07-12). Everything goes inside selector blocks. Checked
+        # state draws a real TICK (svg asset; QSS has no data-URIs).
+        import os as _os
+        _check = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                               "assets", "checkmark.svg").replace("\\", "/")
         self.setStyleSheet(
-            "background:#0d0f14;color:#cfd6e4;font-size:12px;")
+            "QWidget{background:#0d0f14;color:#cfd6e4;font-size:12px;}"
+            "QCheckBox::indicator{width:15px;height:15px;"
+            "border:1px solid #4a5878;border-radius:4px;"
+            "background:#181c26;}"
+            "QCheckBox::indicator:checked{background:#7fd4ff;"
+            f"border-color:#7fd4ff;image:url({_check});}}")
 
         layout = QVBoxLayout(self)
 
@@ -362,70 +413,43 @@ class SoundlabView(QWidget):
         self.info_label = QLabel("")
         hdr.addWidget(self.info_label)
         hdr.addStretch()
+        # top-right, tab-agnostic controls (e.g. Soundlab Log → Disk)
+        self.hdr_controls = QHBoxLayout()
+        hdr.addLayout(self.hdr_controls)
         layout.addLayout(hdr)
 
         self.chart = _Chart()
         self.lanes = _LaneChart()
-        # decomposition tab = lanes + linear-composer controls
-        self.decomp = QWidget()
-        dv = QVBoxLayout(self.decomp)
-        dv.setContentsMargins(0, 0, 0, 0)
-        dv.addWidget(self.lanes, stretch=1)
-        comp_row = QHBoxLayout()
-        comp_lbl = QLabel("r =")
-        comp_lbl.setStyleSheet("color:#8090a8;font-weight:bold;")
-        comp_row.addWidget(comp_lbl)
-        def _emit_mix():
-            spec = ",".join(
-                f"{k}:{max(0.0, self.lanes.weights[k]):.2f}"
-                for k in self.lanes.COMPOSABLE if self.lanes.enabled.get(k))
-            self.mix_changed.emit(spec or "beat:0.0")
 
-        for key in self.lanes.COMPOSABLE:
-            cb = QCheckBox(key)
-            cb.setChecked(self.lanes.enabled[key])
-            cb.toggled.connect(
-                lambda on, k=key: (self.lanes.enabled.__setitem__(k, on),
-                                   _emit_mix()))
-            sp = QDoubleSpinBox()
-            sp.setRange(0.0, 1.0)
-            sp.setSingleStep(0.05)
-            sp.setDecimals(2)
-            sp.setValue(self.lanes.weights[key])
-            sp.setFixedWidth(60)
-            sp.setStyleSheet("background:#181c26;color:#cfd6e4;")
-            sp.valueChanged.connect(
-                lambda v, k=key: (self.lanes.weights.__setitem__(k, v),
-                                  _emit_mix()))
-            comp_row.addWidget(cb)
-            comp_row.addWidget(sp)
-        comp_row.addStretch()
-        note = QLabel("weights auto-renormalized to Σ=1 · DRIVES THE DECK")
-        note.setStyleSheet("color:#8fdccf;font-size:10px;font-weight:bold;")
-        comp_row.addWidget(note)
-        dv.addLayout(comp_row)
-        self.tabs = QTabWidget()
-        self.tabs.setStyleSheet(
-            "QTabBar::tab{background:#181c26;color:#8090a8;padding:5px 14px;}"
-            "QTabBar::tab:selected{background:#232838;color:#cfd6e4;}")
-        self.tabs.addTab(self.chart, "signal")
-        self.tabs.addTab(self.decomp, "decomposition")
-        layout.addWidget(self.tabs, stretch=1)
+        # ---- signal tab = chart + server audio knobs -------------------
+        # Sound Lab is the audio control center: everything that decides
+        # how sound becomes α lives here, not in the main control panel.
+        # Composition itself lives in the GRAPH tab (nodal editor).
+        self.signal_tab = QWidget()
+        sv = QVBoxLayout(self.signal_tab)
+        sv.setContentsMargins(0, 0, 0, 0)
+        sv.addWidget(self.chart, stretch=1)
 
-        # manual lever — big target, fine steps, fires on every move
+        # server audio-group knobs (built from the schema on handshake);
+        # irrelevant knobs auto-hide based on the active α mode/source
+        self.audio_controls = {}
+        self._audio_labels = {}
+        self.audio_row = QHBoxLayout()
+        sv.addLayout(self.audio_row)
+
+        # manual α: checkbox arms the lever (audio_alpha_mode manual ⇄
+        # policy); the lever greys out when the graph is driving
         lever_row = QHBoxLayout()
-        lever_label = QLabel("manual α")
-        lever_label.setStyleSheet("color:#8090a8;")
-        lever_row.addWidget(lever_label)
+        self.manual_cb = QCheckBox("manual α")
+        self.manual_cb.setStyleSheet("color:#8090a8;font-weight:bold;")
+        self.manual_cb.toggled.connect(self._manual_toggled)
+        lever_row.addWidget(self.manual_cb)
         self.lever = QSlider(Qt.Horizontal)
         self.lever.setRange(0, 1000)
         self.lever.setValue(500)
         self.lever.setMinimumHeight(36)
-        self.lever.setStyleSheet(
-            "QSlider::groove:horizontal{height:12px;background:#232838;"
-            "border-radius:6px;}"
-            "QSlider::handle:horizontal{width:34px;margin:-10px 0;"
-            "background:#7fd4ff;border-radius:8px;}")
+        self._style_lever(active=False)
+        self.lever.setEnabled(False)
         self.lever.valueChanged.connect(
             lambda v: (self.lever_value_label.setText(f"{v / 1000:.3f}"),
                        self.manual_changed.emit(v / 1000.0)))
@@ -434,7 +458,31 @@ class SoundlabView(QWidget):
         self.lever_value_label.setStyleSheet(
             "color:#7fd4ff;font-weight:bold;min-width:48px;")
         lever_row.addWidget(self.lever_value_label)
-        layout.addLayout(lever_row)
+        sv.addLayout(lever_row)
+
+        # ---- decomposition tab = lanes only (pure visualization) -------
+        self.decomp = QWidget()
+        dv = QVBoxLayout(self.decomp)
+        dv.setContentsMargins(0, 0, 0, 0)
+        dv.addWidget(self.lanes, stretch=1)
+
+        # ---- graph tab = nodal editor (THE composition authority) ------
+        from components.soundlab_nodes import NodeEditor
+        self.nodes_editor = NodeEditor()
+        self.graph_applied = self.nodes_editor.graph_applied
+
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet(
+            "QTabBar::tab{background:#181c26;color:#8090a8;padding:5px 14px;}"
+            "QTabBar::tab:selected{background:#232838;color:#cfd6e4;}")
+        self.tabs.addTab(self.signal_tab, "signal")
+        self.tabs.addTab(self.decomp, "decomposition")
+        self.tabs.addTab(self.nodes_editor, "graph")
+        layout.addWidget(self.tabs, stretch=1)
+        # events list stays for signal/decomposition; the graph tab has
+        # its own LIVE/DRAFT readouts instead
+        self.tabs.currentChanged.connect(
+            lambda i: self.event_log.setVisible(i != 2))
 
         self.event_log = QPlainTextEdit()
         self.event_log.setReadOnly(True)
@@ -450,7 +498,136 @@ class SoundlabView(QWidget):
         self._timer.start(80)   # ~12 Hz repaint
 
     def _repaint_active(self):
-        (self.chart if self.tabs.currentIndex() == 0 else self.lanes).update()
+        i = self.tabs.currentIndex()
+        if i == 0:
+            self.chart.update()
+        elif i == 1:
+            self.lanes.update()
+        else:
+            self.nodes_editor.tick()
+
+    # ---- manual α lever --------------------------------------------------
+    def _style_lever(self, active: bool) -> None:
+        """Pill-shaped handle; cyan when armed, grey when the graph
+        drives (checkbox unchecked)."""
+        knob = "#7fd4ff" if active else "#3a4358"
+        self.lever.setStyleSheet(
+            "QSlider::groove:horizontal{height:12px;background:#232838;"
+            "border-radius:6px;}"
+            "QSlider::handle:horizontal{width:52px;height:22px;"
+            f"margin:-6px 0;background:{knob};border-radius:11px;}}")
+
+    def _manual_toggled(self, on: bool) -> None:
+        self.lever.setEnabled(bool(on))
+        self._style_lever(active=bool(on))
+        self.knob_changed.emit("audio_alpha_mode",
+                               "manual" if on else "policy")
+        if on:   # arm at the lever's current position immediately
+            self.manual_changed.emit(self.lever.value() / 1000.0)
+
+    # ---- server audio-group knobs (generic mini panel) ------------------
+    # knobs that only matter under specific α modes/sources auto-hide
+    # (user finding 2026-07-12: band/gain shown while policy drives)
+    _KNOB_RELEVANCE = {
+        "audio_band": ("audio_alpha_mode", ("band",)),
+        "audio_reaction_output_gain": ("audio_alpha_mode",
+                                       ("band", "excitation")),
+        "lora_blend_ramp_mode": ("audio_source", ("ramp",)),
+    }
+    def build_audio_controls(self, schema: dict) -> None:
+        """Render the server's audio-group knob descriptors (select /
+        range / checkbox) into the signal tab. Called on every handshake
+        with the current values as defaults; emits knob_changed."""
+        for row in (self.audio_row, self.hdr_controls):
+            while row.count():
+                item = row.takeAt(0)
+                wdg = item.widget()
+                if wdg is not None:
+                    wdg.deleteLater()
+        self.audio_controls = {}
+        self._audio_labels = {}
+        for field, d in sorted(schema.items(),
+                               key=lambda kv: kv[1].get("order", 9999)):
+            ftype = d.get("field")
+            title = str(d.get("title", field)).split("(")[0].strip()
+            if ftype == "select":
+                lab = QLabel(title)
+                lab.setStyleSheet("color:#8090a8;")
+                combo = QComboBox()
+                combo.addItems([str(o) for o in d.get("options", [])])
+                if d.get("default") is not None:
+                    combo.setCurrentText(str(d["default"]))
+                combo.setStyleSheet("background:#181c26;color:#cfd6e4;")
+                combo.currentTextChanged.connect(
+                    lambda t, f=field: (self.knob_changed.emit(f, t),
+                                        self._apply_knob_relevance()))
+                self.audio_row.addWidget(lab)
+                self.audio_row.addWidget(combo)
+                self.audio_controls[field] = combo
+                self._audio_labels[field] = lab
+            elif ftype == "checkbox":
+                cb = QCheckBox(title)
+                cb.setChecked(bool(d.get("default", False)))
+                cb.toggled.connect(
+                    lambda v, f=field: self.knob_changed.emit(f, bool(v)))
+                # soundlab_log lives top-right in the header, tab-agnostic
+                (self.hdr_controls if field == "soundlab_log"
+                 else self.audio_row).addWidget(cb)
+                self.audio_controls[field] = cb
+            elif ftype == "range":
+                lab = QLabel(title)
+                lab.setStyleSheet("color:#8090a8;")
+                sp = QDoubleSpinBox()
+                sp.setRange(float(d.get("min", 0.0)), float(d.get("max", 1.0)))
+                sp.setSingleStep(float(d.get("step", 0.05)))
+                sp.setDecimals(2)
+                sp.setValue(float(d.get("default", 0.0)))
+                sp.setFixedWidth(64)
+                sp.setStyleSheet("background:#181c26;color:#cfd6e4;")
+                sp.valueChanged.connect(
+                    lambda v, f=field: self.knob_changed.emit(f, float(v)))
+                self.audio_row.addWidget(lab)
+                self.audio_row.addWidget(sp)
+                self.audio_controls[field] = sp
+                self._audio_labels[field] = lab
+        self.audio_row.addStretch()
+        self._apply_knob_relevance()
+
+    def _apply_knob_relevance(self) -> None:
+        """Hide knobs that the active α mode/source ignores."""
+        for field, (dep, allowed) in self._KNOB_RELEVANCE.items():
+            wdg = self.audio_controls.get(field)
+            if wdg is None:
+                continue
+            dep_w = self.audio_controls.get(dep)
+            cur = dep_w.currentText() if isinstance(dep_w, QComboBox) else ""
+            show = cur in allowed
+            wdg.setVisible(show)
+            lab = self._audio_labels.get(field)
+            if lab is not None:
+                lab.setVisible(show)
+
+    def update_control(self, field: str, value) -> None:
+        """Programmatic set (reconnect restore / mic-found defaults).
+        Signals are blocked — the caller pushes to the server itself."""
+        wdg = self.audio_controls.get(field)
+        if wdg is None:
+            return
+        wdg.blockSignals(True)
+        try:
+            if isinstance(wdg, QComboBox):
+                wdg.setCurrentText(str(value))
+            elif isinstance(wdg, QCheckBox):
+                wdg.setChecked(bool(value))
+            elif isinstance(wdg, QDoubleSpinBox):
+                wdg.setValue(float(value))
+        finally:
+            wdg.blockSignals(False)
+        self._apply_knob_relevance()
+
+    def set_graph_presets(self, presets: dict) -> None:
+        """Server-advertised graph presets → the nodal editor."""
+        self.nodes_editor.set_presets(presets)
 
     def update_telemetry(self, sl: dict) -> None:
         """Slot for WSClient.soundlab_updated (one dict per frame)."""
@@ -469,6 +646,12 @@ class SoundlabView(QWidget):
         }
         self.chart.frames.append(frame)
         self.lanes.push(sl)
+        # graph tab: live per-node values + the deck's ACTIVE formula
+        self.nodes_editor.update_values(sl.get("graph_vals") or {})
+        f = sl.get("formula")
+        if f:
+            self.nodes_editor.set_active_formula(str(f))
+            self.lanes.formula = str(f)
         for e in sl.get("events") or []:
             self.chart.events.append(e)
             self.lanes.events.append(e)

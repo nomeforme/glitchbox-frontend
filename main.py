@@ -935,16 +935,42 @@ class MainWindow(QMainWindow):
         ws_client_v2.update_knob → server.update(field, value).
         """
         controls = caps.get("controls", {})
+        # Sound Lab is the audio control center: audio-group knobs render
+        # there; everything else stays in the main control panel.
+        audio_schema = {k: v for k, v in controls.items()
+                        if v.get("group") == "audio"}
+        rest = {k: v for k, v in controls.items()
+                if v.get("group") != "audio"}
         if controls:
             self.control_panel.setup_pipeline_options(
-                {"input_params": {"properties": controls}}
+                {"input_params": {"properties": rest}}
             )
         self.control_panel.apply_capabilities(caps)
+        view = self._ensure_soundlab_view()
+        view.build_audio_controls(audio_schema)
+        view.set_graph_presets(caps.get("soundlab_graphs") or {})
         # Re-apply the client's last live-knob values so a reconnect resumes
         # where the session left off instead of snapping back to defaults.
         self._v2_restore_knobs(set(caps.get("live_adjustable", [])))
         # Same for the last-loaded LoRA pair (deferred Load, not a live knob).
         self._v2_restore_lora()
+        # Mic presence is a CLIENT fact (the mic lives here; the server
+        # may be a different machine and only ever sees our PCM stream).
+        # audio+policy are the server defaults, which suit a mic-bearing
+        # client; a MIC-LESS client decides for itself and applies the
+        # `ramp` graph preset so the deck still moves without audio.
+        if (not self.available_microphones
+                and "soundlab_graph" not in self._knob_values
+                and getattr(self, "ws_client_v2", None) is not None):
+            import json as _json
+            ramp_g = (caps.get("soundlab_graphs") or {}).get("ramp")
+            if ramp_g:
+                gjson = _json.dumps(ramp_g)
+                view.nodes_editor.load_graph(ramp_g)   # reflect in editor
+                self.ws_client_v2.update_knob("soundlab_graph", gjson)
+                self._knob_values["soundlab_graph"] = gjson
+                print("[UI/V2] No microphone detected → applied `ramp` "
+                      "graph preset (client-side decision)")
 
     def _v2_remember_knob(self, field, value):
         """Track the latest value of each live knob (see _v2_restore_knobs)."""
@@ -993,16 +1019,27 @@ class MainWindow(QMainWindow):
         if not self._knob_values:
             return
         restored = []
+        lab = self.soundlab_view   # may be None before first handshake
+        lab_controls = getattr(lab, "audio_controls", {}) if lab else {}
+        # knobs with dedicated Sound Lab surfaces (lever / graph): no
+        # widget lookup — just replay the value to the server
+        passthrough = {"soundlab_mix", "soundlab_graph", "manual_alpha",
+                       "audio_alpha_mode"}
         # Snapshot: update_control() re-enters _v2_remember_knob via the
         # widget's own signal in the live window, mutating _knob_values.
         for field, value in list(self._knob_values.items()):
-            if field not in self.control_panel.controls:
+            in_panel = field in self.control_panel.controls
+            in_lab = field in lab_controls
+            if not (in_panel or in_lab or field in passthrough):
                 continue
             if live_fields and field not in live_fields:
                 continue
-            self.control_panel.update_control(field, value)   # reflect in the UI
+            if in_panel:
+                self.control_panel.update_control(field, value)
+            elif in_lab:
+                lab.update_control(field, value)
             if getattr(self, "ws_client_v2", None) is not None:
-                self.ws_client_v2.update_knob(field, value)    # and push to the server
+                self.ws_client_v2.update_knob(field, value)    # push to server
             restored.append(field)
         if restored:
             print(f"[UI/V2] Restored {len(restored)} client knob(s) after reconnect: {restored}")
@@ -1436,10 +1473,22 @@ class MainWindow(QMainWindow):
                 self.soundlab_view.manual_changed.connect(
                     lambda v: self.ws_client_v2.update_knob(
                         "manual_alpha", v))
-                # composer mix -> the deck's r-driver (policy mode)
-                self.soundlab_view.mix_changed.connect(
-                    lambda spec: self.ws_client_v2.update_knob(
-                        "soundlab_mix", spec))
+                # nodal editor patch -> THE deck driver (policy mode)
+                self.soundlab_view.graph_applied.connect(
+                    lambda gjson: self.ws_client_v2.update_knob(
+                        "soundlab_graph", gjson))
+                # Sound Lab is the audio control center: its generic
+                # audio-group knobs flow like control-panel knobs
+                self.soundlab_view.knob_changed.connect(
+                    self.ws_client_v2.update_knob)
+                self.soundlab_view.knob_changed.connect(
+                    self._v2_remember_knob)
+                # remember graph/lever too so reconnects restore them
+                self.soundlab_view.graph_applied.connect(
+                    lambda gjson: self._v2_remember_knob(
+                        "soundlab_graph", gjson))
+                self.soundlab_view.manual_changed.connect(
+                    lambda v: self._v2_remember_knob("manual_alpha", v))
         return self.soundlab_view
 
     def _v2_handle_soundlab(self, sl: dict):
