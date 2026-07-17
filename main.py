@@ -2071,10 +2071,40 @@ class MainWindow(QMainWindow):
         was_camera_running = self.camera_running
         
         try:
-            # Stop camera if it's running
+            # Stop camera if it's running. Deliberately NOT calling
+            # self.stop_camera() here: its cleanup is deferred via
+            # QTimer.singleShot(50, perform_camera_cleanup), which closes
+            # over `self.camera_thread` by reference, not by value. This
+            # method synchronously stops the OLD thread, recreates, and
+            # restarts a NEW one just below — reliably taking well over
+            # 50ms (V4L2 device open + the wait(1000) call) — so that
+            # deferred callback used to fire AFTER self.camera_thread
+            # already pointed at the brand-new thread, calling
+            # .stop()/.terminate() on it moments after it started.
+            # Terminating a QThread while it's inside cv2.VideoCapture's
+            # blocking open() call is what produced a
+            # "FATAL: exception not rethrown" crash. Only the immediate
+            # UI-state reset is needed here; the rest of this method
+            # already does its own correct synchronous stop/recreate/
+            # restart of camera_thread.
+            #
+            # Also deliberately NOT calling self.processed_display.
+            # clear_display() here — it calls stop_stream() under the
+            # hood, tearing down the ZMQ subscriber that receives
+            # rendered output from the server. That subscriber is only
+            # ever restarted by a fresh websocket handshake
+            # (_v2_on_capabilities -> _start_fresh_stream), which a
+            # camera-index change does NOT trigger — the server-side
+            # RealtimeSession and its output stream are completely
+            # independent of which local camera is capturing input.
+            # Clearing it here silently kills the output display until
+            # the user manually disconnects/reconnects.
             if was_camera_running:
-                self.stop_camera()
-            
+                self.frame_timer.stop()
+                self.processing_frame = False
+                self.camera_running = False
+                self.camera_display.clear_display()
+
             # Update the index
             self.camera_device_index = new_index
             
