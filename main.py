@@ -460,9 +460,10 @@ class MainWindow(QMainWindow):
         
         # Initialize threads
         self.ws_client = WebSocketClient(uri=self.server_ws_uri, max_retries=10, initial_retry_delay=1.0)
-        self.camera_thread = CameraThread()
-        # Set the camera device index
-        self.camera_thread.device_index = self.camera_device_index
+        # Single source of truth for camera-thread construction + signal
+        # wiring (see _create_camera_thread). Every recreation path routes
+        # through it so the V2 send gate is never left unwired.
+        self._create_camera_thread()
 
         # Initialize the STT thread with the audio device index (gated by STT_ENABLED).
         # When disabled, self.stt_thread stays None — existing cleanup paths use
@@ -500,7 +501,7 @@ class MainWindow(QMainWindow):
         self.ws_client.settings_received.connect(self.handle_settings)
         self.ws_client.status_changed.connect(self.handle_status_change)
         self.ws_client.param_updated.connect(self.handle_param_update)
-        self.camera_thread.frame_ready.connect(self.handle_camera_frame)
+        # camera_thread.frame_ready is wired in _create_camera_thread().
 
         # --- Realtime V2 wiring ---------------------------------------
         # Build a SessionConfig from server-side defaults (the realtime
@@ -600,7 +601,8 @@ class MainWindow(QMainWindow):
             #   * frame arrives, _v2_grant_held=False → just stash in slot
             self._v2_latest_frame: bytes | None = None
             self._v2_grant_held = False
-            self.camera_thread.frame_ready.connect(self._v2_handle_camera_frame)
+            # camera_thread.frame_ready → _v2_handle_camera_frame is wired in
+            # _create_camera_thread() so every recreation path keeps the gate.
             self.ws_client_v2.send_frame_granted.connect(
                 self._v2_handle_grant
             )
@@ -1382,9 +1384,10 @@ class MainWindow(QMainWindow):
         
         # Recreate threads (except WebSocket which is recreated in reconnect_to_server)
         print("[UI] Recreating threads...")
-        self.camera_thread = CameraThread()
-        self.camera_thread.device_index = self.camera_device_index
-        self.camera_thread.frame_ready.connect(self.handle_camera_frame)
+        # Fully-wired recreate (incl. the V2 send gate) — see
+        # _create_camera_thread. Wiring only handle_camera_frame here would
+        # leave the local preview alive but stop feeding frames to the server.
+        self._create_camera_thread()
         
         # Recreate STT thread (gated by STT_ENABLED)
         if STT_ENABLED:
@@ -2031,6 +2034,26 @@ class MainWindow(QMainWindow):
                 self.status_bar.update_processing_status("Cannot start automatic updates - not connected to server")
                 print("[UI] Cannot start automatic updates - not connected to server")
 
+    def _create_camera_thread(self):
+        """Create and fully wire a fresh CameraThread (single source of truth).
+
+        Every path that (re)creates the camera thread — initial setup, the
+        reconnect teardown, and update_camera_index() — must route through
+        here so the SAME signals are wired each time.
+
+        Critically, under REALTIME_V2 the camera frame is the send gate's
+        dispatch trigger (_v2_handle_camera_frame); a recreation path that
+        wires only handle_camera_frame leaves the local preview working but
+        silently stops feeding frames to the server, which presents as a dead
+        connection after a reconnect or a live camera-index change.
+        """
+        self.camera_thread = CameraThread()
+        self.camera_thread.device_index = self.camera_device_index
+        self.camera_thread.frame_ready.connect(self.handle_camera_frame)
+        if REALTIME_V2:
+            self.camera_thread.frame_ready.connect(self._v2_handle_camera_frame)
+        return self.camera_thread
+
     def update_camera_index(self):
         """Update the camera device index"""
         new_index = self.camera_spinbox.value()
@@ -2062,10 +2085,10 @@ class MainWindow(QMainWindow):
                 if self.camera_thread.isRunning():
                     self.camera_thread.terminate()
             
-            self.camera_thread = CameraThread()
-            self.camera_thread.device_index = self.camera_device_index
-            self.camera_thread.frame_ready.connect(self.handle_camera_frame)
-            
+            # Recreate a FULLY-wired thread (this also re-attaches the V2
+            # send gate — see _create_camera_thread).
+            self._create_camera_thread()
+
             # Restart camera if it was running
             if was_camera_running:
                 self.start_camera()
