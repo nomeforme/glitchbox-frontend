@@ -18,6 +18,7 @@ from typing import Optional
 import numpy as np
 import sounddevice as sd
 from PySide6.QtCore import QThread, Signal
+from scipy.signal import resample_poly
 
 
 class AudioThread(QThread):
@@ -80,50 +81,164 @@ class AudioThread(QThread):
         """Open an input stream — validate + enumerate like the original
         glitchbox frontend's _test_device.
 
-        Tries the configured device first (None = system default), then
-        every device with input channels, each at 1 then 2 channels (the
-        callback downmixes multi-channel to mono). ``sd.check_input_settings``
-        validates before opening so a bad combo is rejected cleanly instead
-        of the opaque PortAudio -9998. All prints flush so the result is
-        actually visible in the (block-buffered) client log.
+        ``sd.check_input_settings`` validates before opening so a bad combo
+        is rejected cleanly instead of the opaque PortAudio -9998. All
+        prints flush so the result is actually visible in the
+        (block-buffered) client log.
+
+        Two modes:
+
+        * Explicit device (``self.input_device_index is not None``, i.e.
+          the user picked one via the mic-index UI): HONOR IT. Try it at
+          ``self.sample_rate`` first, then fall back to the device's own
+          native rate with in-process resampling (see
+          ``_open_at_native_rate``) — never silently substitute different
+          hardware. A raw ALSA ``hw:X,Y`` device (as opposed to the
+          ``pulse``/``default``/``sysdefault`` software-mixed ones) only
+          accepts its one native rate and rejects everything else with
+          "Invalid sample rate"; previously that rejection fell through to
+          scanning *every other input device* until something happened to
+          work, which is how a mic-index switch to a USB mic could end up
+          silently capturing from the laptop's built-in mic instead — the
+          UI would say "updated" while actually recording the wrong source.
+        * Auto-detect (``self.input_device_index is None``, e.g. at
+          startup before the user has chosen anything): keep the original
+          "try the default, then scan every input device" behavior — there
+          is no explicit user intent to honor yet, so grabbing whatever
+          works is the right default.
         """
-        # Candidate devices: configured first, then all real inputs.
-        candidate_devs = [self.input_device_index]
+        if self.input_device_index is not None:
+            dev = self.input_device_index
+            stream = self._open_at_rate(dev, self.sample_rate, self._audio_callback)
+            if stream is not None:
+                return stream
+            stream = self._open_at_native_rate(dev)
+            if stream is not None:
+                return stream
+            raise RuntimeError(
+                f"input device {dev} could not be opened at {self.sample_rate} Hz "
+                f"or its native rate — see [AudioThread] lines above for the "
+                f"per-attempt errors"
+            )
+
+        # Auto-detect: configured device is None, so try PortAudio's default
+        # first, then every other real input device, each at 1 then 2
+        # channels — same as before this fix.
+        candidate_devs = [None]
         try:
             for i, d in enumerate(sd.query_devices()):
-                if d.get("max_input_channels", 0) > 0 and i not in candidate_devs:
+                if d.get("max_input_channels", 0) > 0:
                     candidate_devs.append(i)
         except Exception as e:
             print(f"[AudioThread] device enumeration failed: {e}", flush=True)
 
         for dev in candidate_devs:
-            for ch in (1, 2):
-                try:
-                    sd.check_input_settings(
-                        device=dev, channels=ch, dtype="int16",
-                        samplerate=self.sample_rate,
-                    )
-                    stream = sd.InputStream(
-                        device=dev,
-                        channels=ch,
-                        samplerate=self.sample_rate,
-                        dtype="int16",
-                        blocksize=self.frames_per_chunk,
-                        callback=self._audio_callback,
-                    )
-                    stream.start()
-                    print(
-                        f"[AudioThread] Capturing device={dev} channels={ch} "
-                        f"@ {self.sample_rate} Hz, {self.chunk_ms} ms chunks",
-                        flush=True,
-                    )
-                    return stream
-                except Exception as e:
-                    print(
-                        f"[AudioThread] device={dev} channels={ch} failed: {e}",
-                        flush=True,
-                    )
+            stream = self._open_at_rate(dev, self.sample_rate, self._audio_callback)
+            if stream is not None:
+                return stream
         raise RuntimeError("no working input device found")
+
+    def _open_at_rate(self, dev, rate: int, callback, latency=None):
+        """Try opening ``dev`` at ``rate`` Hz, 1 then 2 channels. Returns the
+        started stream, or None if every attempt failed (each failure is
+        printed). ``latency`` is passed straight to ``sd.InputStream`` —
+        pass ``'high'`` for a resampling callback (see
+        ``_make_resampling_callback``), which does enough per-block CPU work
+        (polyphase resample) that it can occasionally miss PortAudio's
+        default (low-latency) buffer deadline under GIL contention from the
+        rest of the app (camera JPEG encode, network I/O, Qt event loop),
+        surfacing as "input overflow" — a bigger buffer absorbs that jitter
+        at the cost of a bit more end-to-end audio latency."""
+        for ch in (1, 2):
+            try:
+                sd.check_input_settings(
+                    device=dev, channels=ch, dtype="int16", samplerate=rate,
+                )
+                stream = sd.InputStream(
+                    device=dev,
+                    channels=ch,
+                    samplerate=rate,
+                    dtype="int16",
+                    blocksize=int(rate * self.chunk_ms / 1000),
+                    latency=latency,
+                    callback=callback,
+                )
+                stream.start()
+                print(
+                    f"[AudioThread] Capturing device={dev} channels={ch} "
+                    f"@ {rate} Hz, {self.chunk_ms} ms chunks",
+                    flush=True,
+                )
+                return stream
+            except Exception as e:
+                print(
+                    f"[AudioThread] device={dev} channels={ch} @ {rate} Hz "
+                    f"failed: {e}",
+                    flush=True,
+                )
+        return None
+
+    def _open_at_native_rate(self, dev):
+        """Fallback for an explicitly-chosen device that rejected
+        ``self.sample_rate``: query its own default sample rate and open at
+        that instead, resampling every captured block back down to
+        ``self.sample_rate`` before it's queued — the server's handshake
+        already declared a fixed sample_rate, so we adapt the audio to that
+        contract rather than the other way around."""
+        try:
+            info = sd.query_devices(dev)
+            native_rate = int(round(info["default_samplerate"]))
+        except Exception as e:
+            print(
+                f"[AudioThread] could not query native rate for device={dev}: {e}",
+                flush=True,
+            )
+            return None
+        if native_rate == self.sample_rate:
+            return None  # already tried this rate in _open_at_rate
+        stream = self._open_at_rate(
+            dev, native_rate, self._make_resampling_callback(native_rate),
+            latency="high",
+        )
+        if stream is not None:
+            print(
+                f"[AudioThread] device={dev} native rate is {native_rate} Hz "
+                f"(not {self.sample_rate} Hz) — resampling in software",
+                flush=True,
+            )
+        return stream
+
+    def _make_resampling_callback(self, native_rate: int):
+        """Wrap ``_audio_callback``'s logic with polyphase resampling from
+        ``native_rate`` down/up to ``self.sample_rate``. Resampling happens
+        per-block (no filter state carried across callbacks), which can
+        introduce faint clicks at block boundaries — an acceptable
+        trade-off for correctness (capturing from the right device) over
+        pristine audio quality."""
+
+        def callback(indata: np.ndarray, frames: int, time_info, status):
+            if status:
+                print(f"[AudioThread] sounddevice status: {status}")
+            pcm = indata
+            if pcm.dtype != np.int16:
+                clipped = np.clip(pcm, -1.0, 1.0)
+                pcm = (clipped * 32767.0).astype(np.int16)
+            if pcm.ndim == 2 and pcm.shape[1] > 1:
+                pcm = pcm.mean(axis=1).astype(np.int16)
+            resampled = resample_poly(
+                pcm.astype(np.float32), self.sample_rate, native_rate
+            )
+            resampled = np.clip(np.round(resampled), -32768, 32767).astype(np.int16)
+            try:
+                self._q.put_nowait(resampled.tobytes())
+            except queue.Full:
+                try:
+                    self._q.get_nowait()
+                    self._q.put_nowait(resampled.tobytes())
+                except queue.Empty:
+                    pass
+
+        return callback
 
     def run(self) -> None:
         self.running = True

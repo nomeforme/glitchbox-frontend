@@ -575,12 +575,10 @@ class MainWindow(QMainWindow):
             # in the handshake (client_av.sample_rate) — the server builds
             # RealtimeFFTAudioAnalyzer with that exact value, so they can't
             # drift.
-            self.audio_thread = AudioThread(
-                input_device_index=self.audio_device_index,
-                sample_rate=CLIENT_SAMPLE_RATE,
-                chunk_ms=50,
-            )
-            self.audio_thread.pcm_chunk_ready.connect(self._v2_handle_pcm_chunk)
+            # Single source of truth for audio-thread construction + signal
+            # wiring (see _create_audio_thread) — update_mic_index() routes
+            # through it too, so a mic-index change actually takes effect.
+            self._create_audio_thread()
 
             # Joiner state: keep the most recent PCM chunk, pair on each
             # camera frame (camera tick is the dispatch trigger so we
@@ -2135,6 +2133,30 @@ class MainWindow(QMainWindow):
             self.camera_update_button.setEnabled(True)
             self.camera_update_button.setText("Update Camera")
 
+    def _create_audio_thread(self):
+        """Create and fully wire a fresh AudioThread (V2 raw-PCM mic capture).
+
+        Single source of truth, mirroring _create_camera_thread(). Only
+        meaningful under REALTIME_V2 — callers gate accordingly.
+
+        Before this existed, update_mic_index() only recreated the LEGACY
+        stt_thread/fft_thread. The V2 AudioThread — the one that actually
+        captures PCM and ships it to the server via _v2_handle_pcm_chunk,
+        feeding the server-side soundlab/FFT pipeline — was constructed once
+        at startup with whatever self.audio_device_index was at that moment,
+        and never touched again. Switching the mic index in the UI updated
+        the stored index and the (inert, V2=0-only) legacy threads, but the
+        actual captured audio never changed devices — it kept capturing
+        from whatever device was live at startup.
+        """
+        self.audio_thread = AudioThread(
+            input_device_index=self.audio_device_index,
+            sample_rate=CLIENT_SAMPLE_RATE,
+            chunk_ms=50,
+        )
+        self.audio_thread.pcm_chunk_ready.connect(self._v2_handle_pcm_chunk)
+        return self.audio_thread
+
     def update_mic_index(self):
         """Update the microphone device index"""
         new_index = self.mic_spinbox.value()
@@ -2145,26 +2167,37 @@ class MainWindow(QMainWindow):
         if new_index == self.audio_device_index:
             self.status_bar.update_processing_status(f"Microphone already using index {new_index}")
             return
-            
+
         print(f"[UI] Updating microphone index from {self.audio_device_index} to {new_index}")
         self.mic_update_button.setEnabled(False)
         self.mic_update_button.setText("Updating...")
         self.status_bar.update_processing_status(f"Updating microphone to index {new_index}...")
-        
+
         # Store the old states
         was_stt_running = self.stt_active
         was_fft_running = self.fft_active
-        
+        # AudioThread.stop() (threads/audio_thread.py) already stops/waits/
+        # terminates synchronously inline — no deferred QTimer.singleShot
+        # cleanup involved, so (unlike the camera-thread bug) there's no
+        # stale-reference race here; it just needs to actually be called.
+        was_v2_audio_running = (
+            REALTIME_V2
+            and getattr(self, "audio_thread", None) is not None
+            and self.audio_thread.isRunning()
+        )
+
         try:
             # Stop audio threads if they're running
             if was_stt_running:
                 self.toggle_stt()  # This will stop and recreate the thread
             if was_fft_running:
                 self.toggle_fft()  # This will stop and recreate the thread
-            
+            if was_v2_audio_running:
+                self.audio_thread.stop()
+
             # Update the index
             self.audio_device_index = new_index
-            
+
             # Recreate audio threads with new index (STT gated by STT_ENABLED)
             if STT_ENABLED:
                 self.stt_thread = SpeechToTextThread(input_device_index=self.audio_device_index)
@@ -2174,20 +2207,28 @@ class MainWindow(QMainWindow):
 
             self.fft_thread = FFTAnalyzerThread(input_device_index=self.audio_device_index)
             self.fft_thread.fft_data_updated.connect(self.handle_fft_data)
-            
+
+            # Recreate the V2 audio thread with the new index (this also
+            # re-attaches pcm_chunk_ready — see _create_audio_thread) and
+            # restart it if it was running.
+            if REALTIME_V2 and getattr(self, "audio_thread", None) is not None:
+                self._create_audio_thread()
+                if was_v2_audio_running:
+                    self.audio_thread.start()
+
             # Restart audio threads if they were running
             if was_stt_running:
                 self.toggle_stt()  # This will start the new thread
             if was_fft_running:
                 self.toggle_fft()  # This will start the new thread
-                
-            if was_stt_running or was_fft_running:
+
+            if was_stt_running or was_fft_running or was_v2_audio_running:
                 self.status_bar.update_processing_status(f"Microphone updated to index {new_index} and audio processing restarted")
             else:
                 self.status_bar.update_processing_status(f"Microphone updated to index {new_index}")
-                
+
             print(f"[UI] Successfully updated microphone to index {new_index}")
-            
+
         except Exception as e:
             print(f"[UI] Error updating microphone index: {e}")
             self.status_bar.update_processing_status(f"Error updating microphone: {e}")
