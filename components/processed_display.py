@@ -1,6 +1,7 @@
 from PySide6.QtWidgets import QLabel, QWidget, QVBoxLayout, QPushButton, QHBoxLayout
-from PySide6.QtCore import Qt, Signal, QThread
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtOpenGLWidgets import QOpenGLWidget
+from PySide6.QtCore import Qt, Signal, QThread, QRect
+from PySide6.QtGui import QImage, QPixmap, QPainter
 import numpy as np
 import cv2
 import requests
@@ -82,28 +83,86 @@ class StreamThread(QThread):
             print("[Stream] Thread didn't stop gracefully")
 
 class ZMQThread(QThread):
-    """Thread for handling ZMQ image stream"""
-    frame_received = Signal(np.ndarray)
-    
+    """Thread for handling ZMQ image stream.
+
+    ``frame_received`` carries no payload — see ``get_latest_frame()``.
+    """
+    frame_received = Signal()
+
     def __init__(self):
         super().__init__()
         self.running = False
+        # Single-slot mailbox: the network thread overwrites this in place
+        # instead of every decoded frame riding its own queued signal
+        # payload across the thread boundary. Qt's queued-connection event
+        # queue does NOT coalesce custom signals — under jitter, if frames
+        # arrive faster than the GUI thread can paint, a signal-per-frame
+        # design backs the queue up with several stale QImage payloads that
+        # the event loop then dutifully paints in arrival order, compounding
+        # lag instead of degrading gracefully. With a mailbox, every queued
+        # frame_received delivery just triggers a re-read of whatever is
+        # *currently* latest, so a backlog collapses to "always show the
+        # newest frame" instead of painting a growing sequence of stale ones.
+        self._frame_lock = threading.Lock()
+        self._latest_frame = None
+        self._latest_is_bgr = False
+        # Monotonic frame counter: lets the GUI-side consumer skip
+        # duplicate deliveries. Under a paint backlog, several queued
+        # frame_received notifications can all resolve to the same mailbox
+        # content — without this, each would re-render (and re-copy) the
+        # identical frame and inflate the FPS counter.
+        self._frame_seq = 0
         print("[ZMQ] Initializing ZMQ context and socket...")
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.SUB)
         zmq_address = f"tcp://{DEFAULT_SERVER_HOST}:{DEFAULT_SERVER_ZMQ_PORT}"
         print(f"[ZMQ] Attempting to connect to {zmq_address}...")
         try:
+            # CONFLATE keeps only the single latest message in this socket's
+            # own queue — but that alone only governs ZMQ's userspace queue.
+            # Bytes already handed to the OS TCP buffers (which happens
+            # eagerly, well before HWM is typically hit over TCP) are still
+            # subject to ordinary in-order TCP delivery/head-of-line
+            # blocking on the wire. Setting CONFLATE here closes half the
+            # gap (the publisher side sets SNDHWM=2 but not CONFLATE); doing
+            # it on both ends is the documented fix for exactly this
+            # "growing latency under jitter" ZMQ PUB/SUB failure mode.
+            #
+            # IMPORTANT: must be set BEFORE connect() — like the HWM
+            # options, CONFLATE shapes the pipe created at connection time
+            # and setting it after connect() silently does nothing for the
+            # already-established connection. (RCVTIMEO/LINGER/SUBSCRIBE
+            # below are exceptions that apply immediately.)
+            self.socket.setsockopt(zmq.CONFLATE, 1)
             self.socket.connect(zmq_address)
             self.socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all messages
             # Set socket options to prevent blocking
             self.socket.setsockopt(zmq.RCVTIMEO, 1000)  # 1 second receive timeout
             self.socket.setsockopt(zmq.LINGER, 0)  # Don't wait for pending messages on close
-            print("[ZMQ] Socket connected and subscribed")
+            print("[ZMQ] Socket connected and subscribed (CONFLATE on)")
         except Exception as e:
             print(f"[ZMQ] Failed to connect to ZMQ socket: {e}")
             import traceback
             traceback.print_exc()
+
+    def get_latest_frame(self):
+        """Thread-safe read of the mailbox.
+
+        Returns (frame, is_bgr, seq) or None. ``seq`` increments once per
+        published frame — consumers remember the last seq they rendered and
+        skip when unchanged.
+        """
+        with self._frame_lock:
+            if self._latest_frame is None:
+                return None
+            return self._latest_frame, self._latest_is_bgr, self._frame_seq
+
+    def _publish_frame(self, frame, is_bgr: bool):
+        with self._frame_lock:
+            self._latest_frame = frame
+            self._latest_is_bgr = is_bgr
+            self._frame_seq += 1
+        self.frame_received.emit()
 
     def run(self):
         """Process the ZMQ stream"""
@@ -122,19 +181,25 @@ class ZMQThread(QThread):
                     is_jpeg = len(data) >= 2 and data[0] == 0xFF and data[1] == 0xD8
 
                     if is_jpeg:
-                        # Decode JPEG
+                        # Decode JPEG. cv2.imdecode's native output is BGR —
+                        # deliberately NOT converting to RGB here anymore.
+                        # QImage.Format_BGR888 (see ProcessedDisplay) can
+                        # read these bytes directly; the cvtColor was a pure
+                        # per-frame CPU tax (a full-frame channel-shuffle
+                        # copy) for zero benefit, since the display path can
+                        # just be told the bytes are already BGR.
                         frame = cv2.imdecode(
                             np.frombuffer(data, dtype=np.uint8),
                             cv2.IMREAD_COLOR
                         )
-                        if frame is not None:
-                            # Convert BGR to RGB
-                            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        else:
+                        if frame is None:
                             print("[ZMQ] Failed to decode JPEG frame")
                             continue
+                        is_bgr = True
                     else:
-                        # Raw bytes (original behavior)
+                        # Raw bytes (original behavior, legacy/unused by the
+                        # current realtime server which always emits JPEG —
+                        # preserved as its original RGB-assumed layout).
                         frame = np.frombuffer(data, dtype=np.uint8)
 
                         # Calculate expected size based on display dimensions and upscaling
@@ -145,9 +210,10 @@ class ZMQThread(QThread):
 
                         # Reshape to image dimensions accounting for upscaling
                         frame = frame.reshape(int(DISPLAY_HEIGHT * DISPLAY_SCALE), int(DISPLAY_WIDTH * DISPLAY_SCALE), 3)
+                        is_bgr = False
 
                     if frame is not None:
-                        self.frame_received.emit(frame)
+                        self._publish_frame(frame, is_bgr)
                     else:
                         print("[ZMQ] Failed to process frame")
                         
@@ -203,6 +269,45 @@ class ZMQThread(QThread):
         else:
             print("[ZMQ] Thread didn't stop gracefully, will be terminated externally")
 
+
+class GLImageWidget(QOpenGLWidget):
+    """Drop-in replacement for QLabel+QPixmap on the live video path.
+
+    QLabel.setPixmap() forces two CPU-bound costs on *every single frame*:
+    QPixmap.fromImage() deep-copies + reformats the pixel data, and
+    Qt.SmoothTransformation CPU-rescales the whole image to the label's
+    current size — both paid again on every repaint, not just on frame
+    arrival. Painting via QPainter.drawImage() inside a QOpenGLWidget lets
+    Qt's OpenGL-backed paint engine do the scale/composite on the GPU
+    instead. Real-world precedent for this exact swap: ~8-9% CPU vs.
+    saturating a CPU core at 1920x1200@30fps.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._image = None
+
+    def set_image(self, q_image: QImage):
+        self._image = q_image
+        self.update()
+
+    def clear(self):
+        self._image = None
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        if self._image is not None and not self._image.isNull():
+            target_size = self._image.size().scaled(self.size(), Qt.KeepAspectRatio)
+            x = (self.width() - target_size.width()) // 2
+            y = (self.height() - target_size.height()) // 2
+            painter.drawImage(QRect(x, y, target_size.width(), target_size.height()), self._image)
+        else:
+            painter.fillRect(self.rect(), Qt.black)
+        painter.end()
+
+
 class ProcessedDisplay(QWidget):
     """Widget to display processed image output"""
     
@@ -211,10 +316,10 @@ class ProcessedDisplay(QWidget):
         self.layout = QVBoxLayout()
         self.setLayout(self.layout)
         
-        # Image display
-        self.image_label = QLabel()
+        # Image display — GPU-composited (see GLImageWidget); centering is
+        # handled internally in its paintEvent, so no setAlignment here.
+        self.image_label = GLImageWidget()
         self.image_label.setMinimumSize(*min_size)
-        self.image_label.setAlignment(Qt.AlignCenter)
         self.layout.addWidget(self.image_label)
         
         # Projection Mapper button
@@ -240,6 +345,7 @@ class ProcessedDisplay(QWidget):
         # Stream handling
         self.stream_thread = None
         self.zmq_thread = None
+        self._last_rendered_seq = -1  # see _on_zmq_frame duplicate-skip
         
         # Projection mapper window
         self.projection_mapper = None
@@ -290,7 +396,8 @@ class ProcessedDisplay(QWidget):
         # Create and start ZMQ thread
         print("[ZMQ] Starting ZMQ stream")
         self.zmq_thread = ZMQThread()
-        self.zmq_thread.frame_received.connect(self.update_frame)
+        self._last_rendered_seq = -1  # fresh thread → fresh seq space
+        self.zmq_thread.frame_received.connect(self._on_zmq_frame)
         self.zmq_thread.start()
         
         # NOTE: Required for ZMQ to start
@@ -380,7 +487,37 @@ class ProcessedDisplay(QWidget):
             print("[Display] Stream thread cleanup completed")
 
     def update_frame(self, frame: np.ndarray):
-        """Update the display with a new frame"""
+        """Update the display with a new RGB888 frame (legacy MJPEG
+        StreamThread / V1 ws_client path — these still hand over
+        already-RGB-ordered frames)."""
+        self._render_frame(frame, bgr=False)
+
+    def _on_zmq_frame(self):
+        """Mailbox consumer for ZMQThread.frame_received (no payload).
+
+        Always reads ZMQThread.latest_frame — the single mutex-guarded slot
+        the network thread overwrites in place — rather than a payload
+        bundled with this specific signal delivery. If several
+        frame_received deliveries are backlogged in Qt's queued-connection
+        event queue after a stall, each one just repaints whatever is
+        *currently* latest instead of dutifully repainting a growing
+        sequence of stale frames in arrival order.
+        """
+        if not self.zmq_thread:
+            return
+        result = self.zmq_thread.get_latest_frame()
+        if result is None:
+            return
+        frame, is_bgr, seq = result
+        if seq == self._last_rendered_seq:
+            # Backlogged notification resolving to a frame we already
+            # painted — skip the redundant re-copy/repaint entirely.
+            return
+        self._last_rendered_seq = seq
+        self._render_frame(frame, bgr=is_bgr)
+
+    def _render_frame(self, frame: np.ndarray, bgr: bool):
+        """Shared rendering path for both frame sources above."""
         if frame is None:
             return
 
@@ -390,9 +527,9 @@ class ProcessedDisplay(QWidget):
             height = int(DISPLAY_HEIGHT * DISPLAY_SCALE)
             width = int(DISPLAY_WIDTH * DISPLAY_SCALE)
 
-            # Create black frame (RGB)
-            black_frame = np.zeros((height, width, 3), dtype=np.uint8)
-            frame = black_frame
+            # Create black frame
+            frame = np.zeros((height, width, 3), dtype=np.uint8)
+            bgr = False  # all-zero — channel order is moot
 
         # Apply mirroring if enabled
         if self.mirrored:
@@ -400,22 +537,28 @@ class ProcessedDisplay(QWidget):
 
         # Only render on the topmost active layer
         if self.projection_mapper and self.is_fullscreen:
-            # Projection mapper is open - send frame there, don't render locally
-            self.projection_mapper.update_frame(frame)
+            # ProjectionMapperWindow.display_frame() hardcodes
+            # QImage.Format_RGB888 — convert only on this (secondary,
+            # optional) path so the primary live-display path below never
+            # pays for a channel-shuffle it doesn't need.
+            pm_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if bgr else frame
+            self.projection_mapper.update_frame(pm_frame)
         else:
-            # Projection mapper is not open - render in main display
+            # Projection mapper is not open - render in main display.
             height, width = frame.shape[:2]
             bytes_per_line = 3 * width
-            q_image = QImage(frame.data, width, height, bytes_per_line, QImage.Format_RGB888)
-
-            # Get the available size of the label
-            available_size = self.image_label.size()
-
-            # Scale the pixmap to fit the available space while maintaining aspect ratio
-            pixmap = QPixmap.fromImage(q_image)
-            scaled_pixmap = pixmap.scaled(available_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
-            self.image_label.setPixmap(scaled_pixmap)
+            qimage_format = QImage.Format_BGR888 if bgr else QImage.Format_RGB888
+            # .copy() forces QImage to own its pixel buffer now (same
+            # memory-safety guarantee QPixmap.fromImage() used to provide
+            # implicitly) rather than referencing `frame`'s numpy buffer,
+            # which goes out of scope as soon as this function returns —
+            # GLImageWidget.set_image() just stores the QImage and repaints
+            # asynchronously on the next paint cycle, so the buffer must
+            # outlive this call. The scale-to-fit work that used to happen
+            # here via Qt.SmoothTransformation on every paint now happens
+            # once, on the GPU, inside GLImageWidget.paintEvent().
+            q_image = QImage(frame.data, width, height, bytes_per_line, qimage_format).copy()
+            self.image_label.set_image(q_image)
 
         # Update FPS counter in status bar
         main_window = self.window()

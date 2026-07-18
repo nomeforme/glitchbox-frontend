@@ -1089,8 +1089,12 @@ class MainWindow(QMainWindow):
             self._v2_first_cam_frame_logged = True
         try:
             # camera_thread emits RGB; encode as JPEG (BGR for cv2).
+            # Quality 80, explicit: this image only feeds ControlNet/img2img
+            # conditioning server-side, never shown to a human, so OpenCV's
+            # implicit default of 95 was spending upload bandwidth on
+            # fidelity nobody looks at.
             bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            ok, buf = cv2.imencode(".jpg", bgr)
+            ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
             if not ok:
                 return
             jpeg = buf.tobytes()
