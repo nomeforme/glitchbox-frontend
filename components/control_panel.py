@@ -215,6 +215,10 @@ class ControlPanel(QWidget):
 
         options = [str(o) for o in param.get('options', [])]
         presets = param.get('presets', {}) or {}
+        # Kept as instance state so update_lora_options() can repopulate
+        # the dropdowns in place (e.g. after a LoRA Lab deploy).
+        self._lora_options = options
+        self._lora_presets = presets
 
         # Curation-index quick-pick (custom + sorted preset indices).
         cur = QComboBox()
@@ -238,11 +242,12 @@ class ControlPanel(QWidget):
         weight_b = QLineEdit(dwb); weight_b.setFixedWidth(44)
 
         def _on_curation(idx_text):
-            pair = presets.get(idx_text)
+            # Read via self so update_lora_options() swaps take effect.
+            pair = self._lora_presets.get(idx_text)
             if pair and len(pair) == 2:
-                if str(pair[0]) in options:
+                if combo_a.findText(str(pair[0])) >= 0:
                     combo_a.setCurrentText(str(pair[0]))
-                if str(pair[1]) in options:
+                if combo_b.findText(str(pair[1])) >= 0:
                     combo_b.setCurrentText(str(pair[1]))
         cur.currentTextChanged.connect(_on_curation)
 
@@ -272,6 +277,48 @@ class ControlPanel(QWidget):
         self.main_layout.addWidget(container)
         self.controls[param_id] = (cur, combo_a, weight_a, combo_b, weight_b, btn)
         self._lora_param_id = param_id
+
+    def update_lora_options(self, options: list, presets: dict):
+        """Repopulate the LoRA hot-swap dropdowns in place.
+
+        Called when the server's slug registry changes at runtime (a LoRA
+        Lab deploy or pair-create) — the deploy response carries the fresh
+        slug/preset lists so the dropdowns stay current without a
+        reconnect. Current selections are preserved when still valid.
+        """
+        pid = getattr(self, "_lora_param_id", None)
+        if pid is None or pid not in self.controls:
+            return
+        widgets = self.controls[pid]
+        if not (isinstance(widgets, tuple) and len(widgets) >= 6):
+            return
+        cur, combo_a, _wa, combo_b, _wb, _btn = widgets
+
+        options = [str(o) for o in options]
+        presets = dict(presets or {})
+        self._lora_options = options
+        self._lora_presets = presets
+
+        prev_cur = cur.currentText()
+        prev_a = combo_a.currentText()
+        prev_b = combo_b.currentText()
+
+        cur.blockSignals(True)
+        cur.clear()
+        cur_keys = sorted(presets.keys(),
+                          key=lambda k: int(k) if str(k).isdigit() else k)
+        cur.addItems(["(custom)"] + [str(k) for k in cur_keys])
+        if cur.findText(prev_cur) >= 0:
+            cur.setCurrentText(prev_cur)
+        cur.blockSignals(False)
+
+        for combo, prev in ((combo_a, prev_a), (combo_b, prev_b)):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(options)
+            if combo.findText(prev) >= 0:
+                combo.setCurrentText(prev)
+            combo.blockSignals(False)
 
     def add_text_input(self, param_id, param, default_value=None):
         """Add a text input control"""

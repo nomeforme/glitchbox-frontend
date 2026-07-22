@@ -387,11 +387,6 @@ class MainWindow(QMainWindow):
         else:
             self.stt_button = None
         
-        # FFT Toggle button
-        self.fft_button = QPushButton("Start Audio FFT")
-        self.fft_button.clicked.connect(self.toggle_fft)
-        buttons_layout.addWidget(self.fft_button)
-
         # Sound Lab window (server policy-mode telemetry visualizer).
         # Built lazily on first click; telemetry only flows when the
         # server session runs audio_alpha_mode="policy".
@@ -399,6 +394,18 @@ class MainWindow(QMainWindow):
         self.soundlab_button = QPushButton("Sound Lab")
         self.soundlab_button.clicked.connect(self.toggle_soundlab)
         buttons_layout.addWidget(self.soundlab_button)
+
+        # LoRA Lab window (deploy trained kohya checkpoints + curated
+        # caption subsets as live LoRA slugs; see components/lora_lab_view).
+        # Built lazily on first click; requires a connected server (the
+        # catalog + deploy actions are server endpoints), so the button is
+        # gated on connection state via _set_lora_lab_enabled().
+        self.lora_lab_view = None
+        self.lora_lab_button = QPushButton("LoRA Lab")
+        self.lora_lab_button.clicked.connect(self.toggle_lora_lab)
+        self.lora_lab_button.setEnabled(False)
+        self.lora_lab_button.setToolTip("Connect to the server to use LoRA Lab")
+        buttons_layout.addWidget(self.lora_lab_button)
 
         # NOTE: ProjectionMapper has its own toggle button inside
         # ProcessedDisplay ("Projection Mapper" button, see
@@ -677,6 +684,15 @@ class MainWindow(QMainWindow):
         else:
             self.connect_button.setText("Connect to Server")
         self.connect_button.setEnabled(True)
+        # LoRA Lab rides the same transition points but gates on the ACTUAL
+        # connection (its catalog/deploy actions are server HTTP endpoints),
+        # not on user intent like the toggle label above.
+        if getattr(self, "lora_lab_button", None) is not None:
+            connected = bool(getattr(self, "server_connected", False))
+            self.lora_lab_button.setEnabled(connected)
+            self.lora_lab_button.setToolTip(
+                "" if connected else "Connect to the server to use LoRA Lab"
+            )
 
     def toggle_connection(self):
         """Idempotent Connect/Disconnect toggle — the single button's slot."""
@@ -1419,8 +1435,7 @@ class MainWindow(QMainWindow):
         if self.stt_button is not None:
             self.stt_button.setText("Start Speech Recognition")
         self.fft_active = False
-        self.fft_button.setText("Start Audio FFT")
-        
+
         print("[UI] All threads stopped and recreated successfully")
 
     def handle_transcription(self, text):
@@ -1510,35 +1525,77 @@ class MainWindow(QMainWindow):
             view.show()
             view.raise_()
 
+    def _ensure_lora_lab_view(self):
+        """Create the LoRA Lab window on demand (hidden until toggled).
+
+        Same lazy-singleton pattern as Sound Lab. The view drives the
+        server's /lora_lab HTTP endpoints (catalog / deploy / pair); on a
+        successful deploy or pair-create the server hands back the updated
+        slug + preset lists, which we push into the ControlPanel's LoRA
+        hot-swap dropdowns in place — no reconnect, no restart.
+        """
+        if self.lora_lab_view is None:
+            from components.lora_lab_view import LoraLabView
+            self.lora_lab_view = LoraLabView(
+                base_url_provider=lambda: (
+                    f"http://{self.server_host}:{self.server_port}"
+                ),
+            )
+            self.lora_lab_view.registry_updated.connect(
+                self._on_lora_registry_updated)
+        return self.lora_lab_view
+
+    def toggle_lora_lab(self):
+        """Show/hide the LoRA Lab deployment window."""
+        view = self._ensure_lora_lab_view()
+        if view.isVisible():
+            view.hide()
+        else:
+            view.refresh_catalog()
+            view.show()
+            view.raise_()
+
+    def _on_lora_registry_updated(self, slugs, presets):
+        """A LoRA Lab deploy/pair-create changed the server registry —
+        repopulate the LoRA hot-swap dropdowns without reconnecting."""
+        try:
+            self.control_panel.update_lora_options(list(slugs), dict(presets))
+            self.status_bar.update_processing_status(
+                f"LoRA registry updated ({len(slugs)} slugs)")
+        except Exception as e:
+            print(f"[UI] Failed to refresh LoRA dropdowns: {e}")
+
     def toggle_fft(self):
-        """Toggle FFT audio analysis"""
+        """Toggle FFT audio analysis (internal helper — legacy V1 path).
+
+        The "Start Audio FFT" UI button is gone (V2 ships raw PCM per
+        frame; the server runs the FFT pipeline). This remains as the
+        programmatic start/stop used by the mic-device-switch path and
+        the video-mode auto-FFT bookkeeping.
+        """
         if not self.fft_active:
             # Start FFT
             if self.video_mode and self.camera_running:
                 # In video mode, FFT is handled by video_audio_thread
                 self.fft_active = True
-                self.fft_button.setText("Stop Audio FFT")
                 self.status_bar.update_processing_status("FFT audio analysis active (video mode)")
             else:
                 # Start regular FFT thread
                 self.fft_thread.start()
                 self.fft_active = True
-                self.fft_button.setText("Stop Audio FFT")
                 self.status_bar.update_processing_status("FFT audio analysis active")
         else:
             # Stop FFT
             if self.video_mode and self.camera_running:
                 # In video mode, FFT is handled by video_audio_thread
                 self.fft_active = False
-                self.fft_button.setText("Start Audio FFT")
                 self.status_bar.update_processing_status("FFT audio analysis stopped")
             else:
                 # Stop regular FFT thread
                 self.fft_thread.stop()
                 self.fft_active = False
-                self.fft_button.setText("Start Audio FFT")
                 self.status_bar.update_processing_status("FFT audio analysis stopped")
-                
+
                 # Recreate the FFT thread for next use (QThread cannot be restarted)
                 self.fft_thread = FFTAnalyzerThread(input_device_index=self.audio_device_index)
                 self.fft_thread.fft_data_updated.connect(self.handle_fft_data)
@@ -2557,7 +2614,6 @@ class MainWindow(QMainWindow):
                 # Automatically enable FFT in video mode
                 if not self.fft_active:
                     self.fft_active = True
-                    self.fft_button.setText("Stop Audio FFT")
                     self.status_bar.update_processing_status("Video running with FFT - streaming to server")
                 else:
                     self.status_bar.update_processing_status("Video running - streaming to server")
@@ -2628,7 +2684,6 @@ class MainWindow(QMainWindow):
                     # Reset FFT state in video mode
                     if self.fft_active:
                         self.fft_active = False
-                        self.fft_button.setText("Start Audio FFT")
                 else:
                     # Stop camera thread
                     self.camera_thread.stop()
