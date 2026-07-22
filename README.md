@@ -15,22 +15,30 @@ under the `GLITCHBOX_REALTIME_V2=0` feature flag.
 ## Install
 
 ```bash
-uv venv
-source .venv/bin/activate
-uv pip install -e .
+uv sync
 ```
 
-(`pyproject.toml` already pins PySide6, websockets, sounddevice,
-pyzmq, opencv-python, etc.)
+That's it — creates `.venv` and installs the lean base deps (PySide6,
+websockets, sounddevice, pyzmq, opencv-python, …). No torch, no CUDA,
+no `source .venv/bin/activate` ever needed: `uv run` targets the
+project venv by path.
+
+Optional extras:
+
+```bash
+uv sync --extra stt        # speech-to-text (torch + RealtimeSTT + cudnn; NVIDIA GPU)
+uv sync --extra depthcam   # RealSense tools under utils/depthcam/
+```
 
 ## Run
 
 ```bash
-./start_client.sh
+./start_client.sh          # or plain: uv run main.py
 ```
 
-The script activates the venv, exports `LD_LIBRARY_PATH` for cudnn,
-and starts `main.py`. The realtime server is expected to be reachable
+The script runs `main.py` via `uv run` (and, only when
+`GLITCHBOX_STT_ENABLED=1`, exports `LD_LIBRARY_PATH` for the
+stt-extra's cudnn). The realtime server is expected to be reachable
 at `ws://${DEFAULT_SERVER_HOST}:${DEFAULT_SERVER_PORT}/api/installations/plantoid16/live`
 with the output ZMQ pub socket on
 `tcp://${DEFAULT_SERVER_HOST}:${DEFAULT_SERVER_ZMQ_PORT}`.
