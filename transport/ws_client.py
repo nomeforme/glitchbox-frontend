@@ -154,8 +154,8 @@ class WSClient(QThread):
         self,
         slug_a: str,
         slug_b: str,
-        weight_a: float = 0.5,
-        weight_b: float = 0.5,
+        weight_a: float = 1.0,
+        weight_b: float = 1.0,
     ) -> None:
         """Request a LoRA hot-swap (slug A/B + per-LoRA fuse weights). Heavy
         — stalls the server a few seconds; the request/grant gate parks us

@@ -233,11 +233,11 @@ class ControlPanel(QWidget):
         if db in options:
             combo_b.setCurrentText(db)
 
-        # Per-LoRA fuse weights (editable; default 0.5). Applied at fuse
-        # time in fused mode (ignored in dynamic-blend mode, which is
-        # α-driven per frame).
-        dwa = str(param.get('default_weight_a', 0.5))
-        dwb = str(param.get('default_weight_b', 0.5))
+        # Per-LoRA fuse weights (editable; default 1.0 = full strength).
+        # Applied at fuse time in fused mode (ignored in dynamic-blend
+        # mode, which is α-driven per frame).
+        dwa = str(param.get('default_weight_a', 1.0))
+        dwb = str(param.get('default_weight_b', 1.0))
         weight_a = QLineEdit(dwa); weight_a.setFixedWidth(44)
         weight_b = QLineEdit(dwb); weight_b.setFixedWidth(44)
 
@@ -255,11 +255,11 @@ class ControlPanel(QWidget):
             try:
                 wa = float(weight_a.text())
             except ValueError:
-                wa = 0.5
+                wa = 1.0
             try:
                 wb = float(weight_b.text())
             except ValueError:
-                wb = 0.5
+                wb = 1.0
             self.lora_swap_requested.emit(
                 combo_a.currentText(), combo_b.currentText(), wa, wb
             )
