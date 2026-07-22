@@ -34,16 +34,20 @@ import threading
 
 import requests
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont, QPixmap
-from PySide6.QtWidgets import (QComboBox, QGridLayout, QGroupBox,
+from PySide6.QtGui import QFont, QFontMetrics, QPixmap
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QGridLayout, QGroupBox,
                                QHBoxLayout, QLabel, QLineEdit, QPushButton,
                                QScrollArea, QSplitter, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 _STEP_RE = re.compile(r"[-_](?:step)?0*(\d+)\.safetensors$")
 
-_THUMB = 148     # thumbnail edge in the caption grid
-_COLS = 3        # caption-grid columns
+_THUMB = 200          # thumbnail edge in the caption grid
+_CELL_MARGIN = 6      # card inner margin
+_TEXT_LINES = 4       # caption lines on image cards (elided beyond)
+_TEXT_PT = 10         # caption font size
+_GRID_SPACING = 8     # gap between cards
+_FALLBACK_COLS = 3    # used before the viewport has a real width
 
 _STYLE = """
 QWidget { background: #11141b; color: #93a3bd; }
@@ -72,12 +76,47 @@ def _slug_from_checkpoint(checkpoint: str) -> str:
     return slug or "lora"
 
 
-class _CaptionCell(QWidget):
-    """One image+caption tile in the selection grid (kohya-viz style).
+def _wrap_elide(text: str, fm: QFontMetrics, width: int, max_lines: int) -> str:
+    """Greedy word-wrap ``text`` to ``max_lines`` of ``width`` px, eliding
+    the last line with … when the caption overflows the card."""
+    words = text.split()
+    lines: list[str] = []
+    i = 0
+    while i < len(words) and len(lines) < max_lines:
+        line = words[i]
+        i += 1
+        while i < len(words):
+            cand = line + " " + words[i]
+            if fm.horizontalAdvance(cand) <= width:
+                line = cand
+                i += 1
+            else:
+                break
+        lines.append(line)
+    if i < len(words) and lines:  # overflow → elide the last visible line
+        rest = lines[-1] + " " + " ".join(words[i:])
+        lines[-1] = fm.elidedText(rest, Qt.ElideRight, width)
+    return "\n".join(lines)
 
-    Click anywhere on the tile to toggle inclusion; checked tiles get a
-    highlighted border, unchecked ones dim out. Shortlist entries have no
-    training image — the thumb area is hidden and the tile is text-only.
+
+_CHECK_STYLE = """
+QCheckBox { background: rgba(12, 15, 21, 190); border: 1px solid #2a3145;
+            border-radius: 3px; padding: 2px; spacing: 0px; }
+QCheckBox::indicator { width: 15px; height: 15px; border-radius: 2px;
+                       border: 1px solid #93a3bd; background: #0c0f15; }
+QCheckBox::indicator:checked { background: #7fd4ff; border-color: #7fd4ff; }
+"""
+
+
+class _CaptionCell(QWidget):
+    """One image+caption card in the selection grid (kohya-viz style).
+
+    Fixed-size cards: thumbnail with an inclusion checkbox embedded
+    top-left, caption below (larger font, word-wrapped, elided past
+    ``_TEXT_LINES``; full text in the tooltip). Click anywhere on the
+    card to toggle. Unchecked by default. Shortlist entries have no
+    training image — the checkbox sits in a header row instead and the
+    caption gets the freed lines.
     """
 
     toggled = Signal()
@@ -86,64 +125,114 @@ class _CaptionCell(QWidget):
         super().__init__(parent)
         self.caption = caption
         self.image_key = image_key   # run-relative image path, or None
-        self._checked = True
         self.setObjectName("capCell")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(caption)
+        self.setStyleSheet(
+            "QWidget#capCell { background: #0c0f15; "
+            "border: 1px solid #1c2130; border-radius: 4px; }")
 
         v = QVBoxLayout(self)
-        v.setContentsMargins(6, 6, 6, 6)
+        v.setContentsMargins(_CELL_MARGIN, _CELL_MARGIN,
+                             _CELL_MARGIN, _CELL_MARGIN)
         v.setSpacing(4)
+
+        # Inclusion checkbox — none selected by default.
+        self.check = QCheckBox()
+        self.check.setChecked(False)
+        self.check.setStyleSheet(_CHECK_STYLE)
+        self.check.setCursor(Qt.PointingHandCursor)
+        self.check.toggled.connect(lambda _v: self.toggled.emit())
+
+        # Prompt-file position chip ("order in the txt") — shown next to
+        # the checkbox for selected cards; see LoraLabView's header update
+        # for the numbering. Locates offending prompts by line number.
+        self.order_label = QLabel("")
+        self.order_label.setStyleSheet(
+            "background: rgba(12, 15, 21, 190); border: 1px solid #2a3145;"
+            "border-radius: 3px; padding: 1px 5px;"
+            "color: #7fd4ff; font-weight: bold;")
+        self.order_label.setVisible(False)
 
         self.thumb = QLabel("…")
         self.thumb.setFixedSize(_THUMB, _THUMB)
         self.thumb.setAlignment(Qt.AlignCenter)
         self.thumb.setStyleSheet(
             "background: #0c0f15; border: 1px solid #1c2130; color: #4a5468;")
-        if image_key is None:
-            self.thumb.setVisible(False)
-        v.addWidget(self.thumb, 0, Qt.AlignHCenter)
 
-        self.text = QLabel(caption)
-        self.text.setWordWrap(True)
-        self.text.setFixedWidth(_THUMB + 12)
-        f = self.text.font()
-        f.setPointSize(8)
+        f = QFont()
+        f.setPointSize(_TEXT_PT)
+        fm = QFontMetrics(f)
+        text_w = _THUMB - 4
+        text_h = fm.lineSpacing() * _TEXT_LINES + 4
+
+        if image_key is not None:
+            v.addWidget(self.thumb, 0, Qt.AlignHCenter)
+            # Embed checkbox + order chip in the preview's top-left corner.
+            self._overlay = QWidget(self.thumb)
+            oh = QHBoxLayout(self._overlay)
+            oh.setContentsMargins(0, 0, 0, 0)
+            oh.setSpacing(4)
+            oh.addWidget(self.check)
+            oh.addWidget(self.order_label)
+            self._overlay.move(6, 6)
+            self._overlay.raise_()
+            n_lines = _TEXT_LINES
+        else:
+            self._overlay = None
+            self.thumb.setVisible(False)
+            head = QHBoxLayout()
+            head.addWidget(self.check)
+            head.addWidget(self.order_label)
+            head.addStretch(1)
+            v.addLayout(head)
+            # Text-only card: caption inherits the thumbnail's vertical
+            # budget (same fixed card height as its image siblings).
+            spare = _THUMB + 4 - (self.check.sizeHint().height() + 4)
+            n_lines = _TEXT_LINES + max(0, spare // fm.lineSpacing())
+
+        self.text = QLabel(_wrap_elide(caption, fm, text_w, n_lines))
         self.text.setFont(f)
+        self.text.setFixedWidth(_THUMB)
+        self.text.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.text.setStyleSheet("color: #93a3bd; border: none;")
         v.addWidget(self.text)
         v.addStretch(1)
 
-        self._apply_style()
+        # Generous uniform card size — grids stay perfectly aligned and
+        # long captions elide instead of stretching their row.
+        self.setFixedSize(
+            _THUMB + 2 * _CELL_MARGIN + 2,
+            _THUMB + text_h + 2 * _CELL_MARGIN + 4 + 2,
+        )
 
     def set_thumbnail(self, pix: QPixmap):
         self.thumb.setText("")
         self.thumb.setPixmap(pix.scaled(
             _THUMB, _THUMB, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        if self._overlay is not None:
+            self._overlay.raise_()
+
+    def set_order(self, n):
+        """Show/clear the card's 1-based line number in the prompt file."""
+        if n is None:
+            self.order_label.setVisible(False)
+        else:
+            self.order_label.setText(str(n))
+            self.order_label.setVisible(True)
+            if self._overlay is not None:
+                self._overlay.adjustSize()
+                self._overlay.raise_()
 
     def is_checked(self) -> bool:
-        return self._checked
+        return self.check.isChecked()
 
     def set_checked(self, val: bool):
-        val = bool(val)
-        if val != self._checked:
-            self._checked = val
-            self._apply_style()
-            self.toggled.emit()
+        self.check.setChecked(bool(val))
 
     def mousePressEvent(self, _event):
-        self.set_checked(not self._checked)
-
-    def _apply_style(self):
-        if self._checked:
-            self.setStyleSheet(
-                "QWidget#capCell { background: #15202b; "
-                "border: 1px solid #7fd4ff; border-radius: 4px; }")
-            self.text.setStyleSheet("color: #93a3bd; border: none;")
-        else:
-            self.setStyleSheet(
-                "QWidget#capCell { background: #0c0f15; "
-                "border: 1px solid #1c2130; border-radius: 4px; }")
-            self.text.setStyleSheet("color: #4a5468; border: none;")
+        self.check.toggle()
 
 
 class LoraLabView(QWidget):
@@ -193,6 +282,10 @@ class LoraLabView(QWidget):
         root.addLayout(top)
 
         split = QSplitter(Qt.Horizontal)
+        self._split = split
+        # Re-flow the caption grid when the splitter changes the space
+        # available to the right panel.
+        split.splitterMoved.connect(lambda *_: self._relayout_grid())
         root.addWidget(split, 1)
 
         # Left: trained LoRAs (datasets → runs).
@@ -250,13 +343,14 @@ class LoraLabView(QWidget):
             cap_row.addWidget(b)
         dl.addLayout(cap_row)
 
-        # Image + caption tile grid (kohya-viz style): visually pick which
-        # captions ship as prompts. Thumbs stream in asynchronously.
+        # Image + caption card grid (kohya-viz style): visually pick which
+        # captions ship as prompts. Thumbs stream in asynchronously; the
+        # column count adapts to the available width (see _relayout_grid).
         self.captions_scroll = QScrollArea()
         self.captions_scroll.setWidgetResizable(True)
         self._grid_host = QWidget()
         self.captions_grid = QGridLayout(self._grid_host)
-        self.captions_grid.setSpacing(6)
+        self.captions_grid.setSpacing(_GRID_SPACING)
         self.captions_scroll.setWidget(self._grid_host)
         dl.addWidget(self.captions_scroll, 1)
 
@@ -391,6 +485,18 @@ class LoraLabView(QWidget):
             self.ckpt_combo.setCurrentIndex(self.ckpt_combo.count() - 1)
         self.ckpt_combo.blockSignals(False)
 
+        # But prefer the slug's currently-DEPLOYED checkpoint when one
+        # exists — reopening a deployed LoRA reflects what's live (same
+        # spirit as the caption pre-selection).
+        cand = self.ckpt_combo.currentData()
+        if cand:
+            dep = self._deployed().get(_slug_from_checkpoint(cand)) or {}
+            dep_ck = dep.get("checkpoint")
+            if dep_ck:
+                idx = self.ckpt_combo.findData(dep_ck)
+                if idx >= 0:
+                    self.ckpt_combo.setCurrentIndex(idx)
+
         trig = run.get("trigger")
         self.trigger_label.setText(f"trigger: {trig}" if trig else "")
 
@@ -449,21 +555,79 @@ class LoraLabView(QWidget):
         self._cells = []
 
         pool = self._caption_pool_items()
-        for i, it in enumerate(pool):
+        for it in pool:
             cell = _CaptionCell(it["caption"], it.get("image"))
             cell.toggled.connect(self._update_captions_header)
-            self.captions_grid.addWidget(cell, i // _COLS, i % _COLS,
-                                         Qt.AlignTop)
             self._cells.append(cell)
-        # Keep tiles top-left aligned when the grid is sparse.
-        rows = (len(pool) + _COLS - 1) // _COLS
-        self.captions_grid.setRowStretch(rows, 1)
-        self.captions_grid.setColumnStretch(_COLS, 1)
+
+        # Pre-select the slug's EXISTING deployed caption set (if any) so
+        # a redeploy starts from what's live — unselect the offenders,
+        # add others, redeploy.
+        n_pre = self._preselect_deployed()
+        self._relayout_grid(force=True)
         self._update_captions_header()
+        if n_pre:
+            self.status_label.setText(
+                f"Pre-selected {n_pre} caption(s) from the deployed "
+                f"'{self.slug_edit.text().strip()}' prompt file")
 
         if self._current_run and any(it.get("image") for it in pool):
             ds_name, run = self._current_run
             self._start_thumb_loader(ds_name, run["run_id"], pool)
+
+    def _preselect_deployed(self) -> int:
+        """Check the cards whose caption is in the current slug's deployed
+        prompt file. Returns how many were pre-selected (0 = fresh slug)."""
+        slug = self.slug_edit.text().strip()
+        lines = (self._deployed().get(slug) or {}).get("prompt_lines") or []
+        if not lines:
+            return 0
+        existing = {" ".join(ln.split()) for ln in lines}
+        n = 0
+        for cell in self._cells:
+            if " ".join(cell.caption.split()) in existing:
+                cell.set_checked(True)
+                n += 1
+        return n
+
+    def _grid_col_count(self) -> int:
+        """Columns that fit the scroll viewport at the fixed card width."""
+        vp = self.captions_scroll.viewport().width()
+        if vp <= 0 or not self._cells:
+            return _FALLBACK_COLS
+        cell_w = self._cells[0].width()
+        return max(1, (vp - _GRID_SPACING) // (cell_w + _GRID_SPACING))
+
+    def _relayout_grid(self, force: bool = False):
+        """(Re)place the cards at as many columns as fit the width."""
+        if not self._cells:
+            return
+        cols = self._grid_col_count()
+        if not force and cols == getattr(self, "_grid_cols", None):
+            return
+        # Clear stale stretch factors from the previous geometry, then
+        # detach every item (widgets survive; they're re-added below).
+        old_col = getattr(self, "_stretch_col", None)
+        old_row = getattr(self, "_stretch_row", None)
+        if old_col is not None:
+            self.captions_grid.setColumnStretch(old_col, 0)
+        if old_row is not None:
+            self.captions_grid.setRowStretch(old_row, 0)
+        while self.captions_grid.count():
+            self.captions_grid.takeAt(0)
+        for i, cell in enumerate(self._cells):
+            self.captions_grid.addWidget(cell, i // cols, i % cols,
+                                         Qt.AlignTop | Qt.AlignLeft)
+        rows = (len(self._cells) + cols - 1) // cols
+        self.captions_grid.setColumnStretch(cols, 1)
+        self.captions_grid.setRowStretch(rows, 1)
+        self._grid_cols = cols
+        self._stretch_col = cols
+        self._stretch_row = rows
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._relayout_grid()
 
     def _start_thumb_loader(self, dataset, run_id, items):
         """Stream thumbnails into the grid from one daemon worker."""
@@ -511,9 +675,18 @@ class LoraLabView(QWidget):
         return [c.caption for c in self._cells if c.is_checked()]
 
     def _update_captions_header(self):
-        n = len(self._checked_captions())
-        total = len(self._cells)
-        self.captions_header.setText(f"Captions — {n} of {total} selected")
+        # Number the selected cards 1..N in grid order — exactly the line
+        # each caption gets in the (re)deployed prompts txt, so a bad
+        # prompt seen at line k is the card chipped "k".
+        k = 0
+        for cell in self._cells:
+            if cell.is_checked():
+                k += 1
+                cell.set_order(k)
+            else:
+                cell.set_order(None)
+        self.captions_header.setText(
+            f"Captions — {k} of {len(self._cells)} selected")
 
     # -- deploy --------------------------------------------------------------
 
