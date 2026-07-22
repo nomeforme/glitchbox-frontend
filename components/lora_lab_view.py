@@ -34,14 +34,16 @@ import threading
 
 import requests
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
-from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QGroupBox,
-                               QHBoxLayout, QLabel, QLineEdit, QListWidget,
-                               QListWidgetItem, QPushButton, QSplitter,
-                               QTreeWidget, QTreeWidgetItem, QVBoxLayout,
-                               QWidget)
+from PySide6.QtGui import QFont, QPixmap
+from PySide6.QtWidgets import (QComboBox, QGridLayout, QGroupBox,
+                               QHBoxLayout, QLabel, QLineEdit, QPushButton,
+                               QScrollArea, QSplitter, QTreeWidget,
+                               QTreeWidgetItem, QVBoxLayout, QWidget)
 
 _STEP_RE = re.compile(r"[-_](?:step)?0*(\d+)\.safetensors$")
+
+_THUMB = 148     # thumbnail edge in the caption grid
+_COLS = 3        # caption-grid columns
 
 _STYLE = """
 QWidget { background: #11141b; color: #93a3bd; }
@@ -70,6 +72,80 @@ def _slug_from_checkpoint(checkpoint: str) -> str:
     return slug or "lora"
 
 
+class _CaptionCell(QWidget):
+    """One image+caption tile in the selection grid (kohya-viz style).
+
+    Click anywhere on the tile to toggle inclusion; checked tiles get a
+    highlighted border, unchecked ones dim out. Shortlist entries have no
+    training image — the thumb area is hidden and the tile is text-only.
+    """
+
+    toggled = Signal()
+
+    def __init__(self, caption: str, image_key, parent=None):
+        super().__init__(parent)
+        self.caption = caption
+        self.image_key = image_key   # run-relative image path, or None
+        self._checked = True
+        self.setObjectName("capCell")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setCursor(Qt.PointingHandCursor)
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(6, 6, 6, 6)
+        v.setSpacing(4)
+
+        self.thumb = QLabel("…")
+        self.thumb.setFixedSize(_THUMB, _THUMB)
+        self.thumb.setAlignment(Qt.AlignCenter)
+        self.thumb.setStyleSheet(
+            "background: #0c0f15; border: 1px solid #1c2130; color: #4a5468;")
+        if image_key is None:
+            self.thumb.setVisible(False)
+        v.addWidget(self.thumb, 0, Qt.AlignHCenter)
+
+        self.text = QLabel(caption)
+        self.text.setWordWrap(True)
+        self.text.setFixedWidth(_THUMB + 12)
+        f = self.text.font()
+        f.setPointSize(8)
+        self.text.setFont(f)
+        v.addWidget(self.text)
+        v.addStretch(1)
+
+        self._apply_style()
+
+    def set_thumbnail(self, pix: QPixmap):
+        self.thumb.setText("")
+        self.thumb.setPixmap(pix.scaled(
+            _THUMB, _THUMB, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def is_checked(self) -> bool:
+        return self._checked
+
+    def set_checked(self, val: bool):
+        val = bool(val)
+        if val != self._checked:
+            self._checked = val
+            self._apply_style()
+            self.toggled.emit()
+
+    def mousePressEvent(self, _event):
+        self.set_checked(not self._checked)
+
+    def _apply_style(self):
+        if self._checked:
+            self.setStyleSheet(
+                "QWidget#capCell { background: #15202b; "
+                "border: 1px solid #7fd4ff; border-radius: 4px; }")
+            self.text.setStyleSheet("color: #93a3bd; border: none;")
+        else:
+            self.setStyleSheet(
+                "QWidget#capCell { background: #0c0f15; "
+                "border: 1px solid #1c2130; border-radius: 4px; }")
+            self.text.setStyleSheet("color: #4a5468; border: none;")
+
+
 class LoraLabView(QWidget):
     """Deploy-pipeline window; see module docstring."""
 
@@ -80,6 +156,7 @@ class LoraLabView(QWidget):
     _catalog_done = Signal(object, str)   # (payload | None, error)
     _deploy_done = Signal(object, str)
     _pair_done = Signal(object, str)
+    _thumb_done = Signal(int, int, bytes)  # (generation, cell idx, jpeg)
 
     def __init__(self, base_url_provider, parent=None):
         super().__init__(parent)
@@ -88,15 +165,18 @@ class LoraLabView(QWidget):
         self._current_run = None      # (dataset_name, run_dict)
         self._slug_edited = False     # user typed a custom slug
         self._busy = False
+        self._cells = []              # _CaptionCell widgets, grid order
+        self._thumb_gen = 0           # invalidates in-flight thumb loads
 
         self.setWindowTitle("LoRA Lab")
-        self.resize(1000, 640)
+        self.resize(1180, 700)
         self.setStyleSheet(_STYLE)
         self._build_ui()
 
         self._catalog_done.connect(self._on_catalog_done)
         self._deploy_done.connect(self._on_deploy_done)
         self._pair_done.connect(self._on_pair_done)
+        self._thumb_done.connect(self._on_thumb)
 
     # -- UI ------------------------------------------------------------------
 
@@ -164,16 +244,21 @@ class LoraLabView(QWidget):
         for text, slot in (("All", self._check_all),
                            ("None", self._check_none)):
             b = QPushButton(text)
-            b.setFixedWidth(52)
+            # No fixed width — let the style's padding size the button
+            # (a 52 px fixed width clipped "None").
             b.clicked.connect(slot)
             cap_row.addWidget(b)
         dl.addLayout(cap_row)
 
-        self.captions_list = QListWidget()
-        self.captions_list.setSelectionMode(QAbstractItemView.NoSelection)
-        self.captions_list.itemChanged.connect(
-            lambda _i: self._update_captions_header())
-        dl.addWidget(self.captions_list, 1)
+        # Image + caption tile grid (kohya-viz style): visually pick which
+        # captions ship as prompts. Thumbs stream in asynchronously.
+        self.captions_scroll = QScrollArea()
+        self.captions_scroll.setWidgetResizable(True)
+        self._grid_host = QWidget()
+        self.captions_grid = QGridLayout(self._grid_host)
+        self.captions_grid.setSpacing(6)
+        self.captions_scroll.setWidget(self._grid_host)
+        dl.addWidget(self.captions_scroll, 1)
 
         self.deploy_button = QPushButton("Deploy LoRA")
         self.deploy_button.clicked.connect(self._deploy)
@@ -200,7 +285,7 @@ class LoraLabView(QWidget):
         rl.addWidget(pair_box)
 
         split.addWidget(right)
-        split.setSizes([380, 620])
+        split.setSizes([320, 840])
 
     # -- HTTP plumbing -------------------------------------------------------
 
@@ -333,49 +418,101 @@ class LoraLabView(QWidget):
         if ck:
             self.slug_edit.setText(_slug_from_checkpoint(ck))
 
-    def _caption_pool(self):
+    def _caption_pool_items(self):
+        """Current caption source as [{"caption", "image"}, ...].
+
+        Training captions carry their paired image (thumb-able); shortlist
+        entries are curated prompt text with no image. Falls back to the
+        plain ``captions`` list when talking to a server without
+        ``caption_items``.
+        """
         if not self._current_run:
             return []
         _ds, run = self._current_run
         if self.src_combo.currentText() == "curated shortlist":
-            return run.get("shortlist") or []
-        return run.get("captions") or []
+            return [{"caption": s, "image": None}
+                    for s in (run.get("shortlist") or [])]
+        items = run.get("caption_items")
+        if items:
+            return items
+        return [{"caption": c, "image": None}
+                for c in (run.get("captions") or [])]
 
     def _populate_captions(self):
-        self.captions_list.blockSignals(True)
-        self.captions_list.clear()
-        for cap in self._caption_pool():
-            item = QListWidgetItem(cap)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked)
-            self.captions_list.addItem(item)
-        self.captions_list.blockSignals(False)
+        # Invalidate in-flight thumbnail loads for the previous grid.
+        self._thumb_gen += 1
+        while self.captions_grid.count():
+            item = self.captions_grid.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._cells = []
+
+        pool = self._caption_pool_items()
+        for i, it in enumerate(pool):
+            cell = _CaptionCell(it["caption"], it.get("image"))
+            cell.toggled.connect(self._update_captions_header)
+            self.captions_grid.addWidget(cell, i // _COLS, i % _COLS,
+                                         Qt.AlignTop)
+            self._cells.append(cell)
+        # Keep tiles top-left aligned when the grid is sparse.
+        rows = (len(pool) + _COLS - 1) // _COLS
+        self.captions_grid.setRowStretch(rows, 1)
+        self.captions_grid.setColumnStretch(_COLS, 1)
         self._update_captions_header()
 
-    def _set_all_checks(self, state):
-        self.captions_list.blockSignals(True)
-        for i in range(self.captions_list.count()):
-            self.captions_list.item(i).setCheckState(state)
-        self.captions_list.blockSignals(False)
+        if self._current_run and any(it.get("image") for it in pool):
+            ds_name, run = self._current_run
+            self._start_thumb_loader(ds_name, run["run_id"], pool)
+
+    def _start_thumb_loader(self, dataset, run_id, items):
+        """Stream thumbnails into the grid from one daemon worker."""
+        gen = self._thumb_gen
+        url = self._api("lora_lab/thumb")
+
+        def work():
+            for idx, it in enumerate(items):
+                if gen != self._thumb_gen:
+                    return  # grid was rebuilt — abandon
+                img = it.get("image")
+                if not img:
+                    continue
+                try:
+                    r = requests.get(url, params={
+                        "dataset": dataset, "run_id": run_id,
+                        "image": img, "size": 192,
+                    }, timeout=15)
+                    if r.ok:
+                        self._thumb_done.emit(gen, idx, r.content)
+                except Exception:
+                    pass  # placeholder tile stays
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_thumb(self, gen, idx, data):
+        if gen != self._thumb_gen or idx >= len(self._cells):
+            return
+        pix = QPixmap()
+        if pix.loadFromData(data):
+            self._cells[idx].set_thumbnail(pix)
+
+    def _set_all_checks(self, checked):
+        for cell in self._cells:
+            cell.set_checked(checked)
         self._update_captions_header()
 
     def _check_all(self):
-        self._set_all_checks(Qt.Checked)
+        self._set_all_checks(True)
 
     def _check_none(self):
-        self._set_all_checks(Qt.Unchecked)
+        self._set_all_checks(False)
 
     def _checked_captions(self):
-        out = []
-        for i in range(self.captions_list.count()):
-            item = self.captions_list.item(i)
-            if item.checkState() == Qt.Checked:
-                out.append(item.text())
-        return out
+        return [c.caption for c in self._cells if c.is_checked()]
 
     def _update_captions_header(self):
         n = len(self._checked_captions())
-        total = self.captions_list.count()
+        total = len(self._cells)
         self.captions_header.setText(f"Captions — {n} of {total} selected")
 
     # -- deploy --------------------------------------------------------------
