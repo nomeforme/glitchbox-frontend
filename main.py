@@ -105,6 +105,11 @@ class MainWindow(QMainWindow):
         # Initialize device indices from config
         self.camera_device_index = CAMERA_DEVICE_INDEX
         self.audio_device_index = MIC_DEVICE_INDEX
+
+        # Server render aspect for the camera thread's "Match server aspect"
+        # crop. 4:3 (the production preset renders 1024x768) until the
+        # session_ready capabilities deliver the session's true dimensions.
+        self._server_aspect = (4, 3)
         
         # Video input mode
         self.video_mode = False
@@ -278,7 +283,22 @@ class MainWindow(QMainWindow):
         camera_layout.addWidget(camera_label)
         camera_layout.addWidget(self.camera_spinbox)
         camera_layout.addWidget(self.camera_update_button)
-        
+
+        # Capture aspect conditioning (client-side; the server never knows).
+        # Checked: center-crop capture to the server's render aspect so the
+        # server's stretch-resize is distortion-free (aspect arrives in the
+        # session_ready capabilities; 4:3 assumed until first connect).
+        # Unchecked: no crop — full sensor FOV, server stretch shows.
+        self.aspect_checkbox = QCheckBox("Match server aspect")
+        self.aspect_checkbox.setChecked(True)
+        self.aspect_checkbox.setToolTip(
+            "Center-crop the camera to the server's render aspect ratio\n"
+            "(distortion-free, slightly narrower FOV). Uncheck for the\n"
+            "full sensor FOV with the server's stretch visible."
+        )
+        self.aspect_checkbox.toggled.connect(self._on_match_aspect_toggled)
+        camera_layout.addWidget(self.aspect_checkbox)
+
         device_controls_layout.addLayout(camera_layout)
         
         # Microphone Index Control
@@ -1183,6 +1203,23 @@ class MainWindow(QMainWindow):
         self.server_connected = True
         self._user_wants_connected = True
         self._refresh_connection_button()
+        # Adopt the session's true render aspect for the camera thread's
+        # "Match server aspect" crop (caps carry cfg.width/height — e.g.
+        # 1024x768 → 4:3). Reduced via gcd purely for readable logs; the
+        # crop math works with any integer pair.
+        try:
+            w, h = int(caps.get("width", 0)), int(caps.get("height", 0))
+            if w > 0 and h > 0:
+                from math import gcd
+                g = gcd(w, h)
+                self._server_aspect = (w // g, h // g)
+                thread = getattr(self, "camera_thread", None)
+                if thread is not None:
+                    thread.target_aspect = self._server_aspect
+                print(f"[UI/V2] Server renders {w}x{h} → camera crop target "
+                      f"{self._server_aspect[0]}:{self._server_aspect[1]}")
+        except (TypeError, ValueError):
+            pass
         self.status_bar.update_processing_status(
             f"V2 connected: {self.server_host}:{self.server_port}"
         )
@@ -2108,10 +2145,22 @@ class MainWindow(QMainWindow):
         """
         self.camera_thread = CameraThread()
         self.camera_thread.device_index = self.camera_device_index
+        self.camera_thread.match_aspect = self.aspect_checkbox.isChecked()
+        self.camera_thread.target_aspect = self._server_aspect
         self.camera_thread.frame_ready.connect(self.handle_camera_frame)
         if REALTIME_V2:
             self.camera_thread.frame_ready.connect(self._v2_handle_camera_frame)
         return self.camera_thread
+
+    def _on_match_aspect_toggled(self, checked):
+        """Live-toggle the camera thread's aspect crop (no restart needed —
+        the capture loop reads the flag once per frame)."""
+        thread = getattr(self, "camera_thread", None)
+        if thread is not None:
+            thread.match_aspect = bool(checked)
+        aw, ah = self._server_aspect
+        print(f"[UI] Match server aspect: {'on' if checked else 'off'} "
+              f"(target {aw}:{ah})")
 
     def update_camera_index(self):
         """Update the camera device index"""
