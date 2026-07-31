@@ -69,6 +69,11 @@ class WSClient(QThread):
     connection_error = Signal(str)
     status_changed = Signal(str)
     error_message = Signal(str)                 # server-pushed {"type":"error"}
+    # Per-side trigger prefixes for the user-prompt A/B fields, pushed on
+    # swap_ack / lora_enabled_ack ("" = LoRAs disabled / no triggers).
+    # main.py swaps them into the fields while preserving whatever the
+    # user typed after them.
+    prompt_prefix_changed = Signal(str, str)    # (prefix_a, prefix_b)
     # Per-frame "you may send the next frame" grant from the server.
     # Glitchbox-faithful — equivalent of the legacy
     # ``{"status":"send_frame"}`` text message in the old protocol. The
@@ -168,6 +173,23 @@ class WSClient(QThread):
                 "type": "swap_lora",
                 "slug_a": slug_a, "slug_b": slug_b,
                 "weight_a": float(weight_a), "weight_b": float(weight_b),
+            }),
+            self.loop,
+        )
+
+    def set_lora_enabled(self, enabled: bool) -> None:
+        """Toggle the server's fused LoRA stack on/off (prompts untouched).
+
+        Swap-class heavy operation server-side (restore base / re-fuse,
+        few-second stall; the request/grant gate parks us). Distinct from
+        swap_lora(none, none), which would also wipe the prompt lists.
+        Thread-safe.
+        """
+        if not self.connected or self.loop is None:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._send_text({
+                "type": "set_lora_enabled", "enabled": bool(enabled),
             }),
             self.loop,
         )
@@ -367,6 +389,13 @@ class WSClient(QThread):
                             "received from server"
                         )
                     self.send_frame_granted.emit()
+                elif t in ("swap_ack", "lora_enabled_ack"):
+                    # Both acks carry the per-side trigger prefixes of the
+                    # (now-)active LoRA set — "" when disabled/none loaded.
+                    self.prompt_prefix_changed.emit(
+                        str(data.get("prompt_prefix", "")),
+                        str(data.get("prompt_prefix_b", "")),
+                    )
                 elif t == "error":
                     self.error_message.emit(str(data.get("message", "unknown")))
                 # Unknown types are silently ignored — forward-compatible.

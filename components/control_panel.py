@@ -19,6 +19,13 @@ class ControlPanel(QWidget):
     # LoRA hot-swap request: (slug_a, slug_b, weight_a, weight_b). Emitted
     # on the Load button; main.py wires it to WSClient.swap_lora.
     lora_swap_requested = Signal(str, str, float, float)
+    # LoRA enable/disable toggle (heavy swap-class server operation — NOT a
+    # live knob). main.py wires it to WSClient.set_lora_enabled.
+    lora_toggle_changed = Signal(bool)
+    # Client-side camera crop toggle ("Match Server Aspect") — injected by
+    # main.py into the schema so it renders among the server controls, but
+    # it never touches the server. main.py wires it to the camera thread.
+    aspect_toggle_changed = Signal(bool)
 
     def __init__(self):
         super().__init__()
@@ -91,6 +98,12 @@ class ControlPanel(QWidget):
                 self.add_select(param_id, param, default_value)
             elif field_type == 'lora_swap':
                 self.add_lora_swap(param_id, param, default_value)
+            elif field_type == 'lora_toggle':
+                self.add_signal_checkbox(
+                    param_id, param, default_value, self.lora_toggle_changed)
+            elif field_type == 'aspect_toggle':
+                self.add_signal_checkbox(
+                    param_id, param, default_value, self.aspect_toggle_changed)
 
         # Add stretch at the end so controls stay at top
         self.main_layout.addStretch()
@@ -143,6 +156,26 @@ class ControlPanel(QWidget):
 
         self.main_layout.addWidget(container)
         self.controls[param_id] = (slider, value_edit)
+
+    def add_signal_checkbox(self, param_id, param, default_value, signal):
+        """Checkbox wired to a DEDICATED signal instead of the generic
+        parameter/knob path. Used for controls whose toggle triggers a
+        bespoke action in main.py (heavy LoRA enable/disable, client-side
+        camera aspect crop) rather than a plain server field update."""
+        container = QWidget()
+        container.setMinimumHeight(CHECKBOX_MIN_HEIGHT)
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 4, 0, 4)
+
+        checkbox = QCheckBox(param.get('title', param_id))
+        checked = default_value if default_value is not None \
+            else param.get('default', False)
+        checkbox.setChecked(bool(checked))
+        checkbox.toggled.connect(lambda v, sig=signal: sig.emit(bool(v)))
+        layout.addWidget(checkbox)
+
+        self.main_layout.addWidget(container)
+        self.controls[param_id] = checkbox
 
     def add_checkbox(self, param_id, param, default_value=None):
         """Add a checkbox control"""
@@ -267,6 +300,31 @@ class ControlPanel(QWidget):
         btn = QPushButton("Load")
         btn.clicked.connect(_on_load)
 
+        def _on_swap():
+            # Swap the A/B slug selections + fuse weights in place, then
+            # load the swapped pair (same heavy path as Load). The server's
+            # swap_ack carries the per-side trigger prefixes of the new
+            # orientation, so the user-prompt A/B fields swap their
+            # prefixes automatically (typed text stays put).
+            a, b = combo_a.currentText(), combo_b.currentText()
+            wa_t, wb_t = weight_a.text(), weight_b.text()
+            combo_a.setCurrentText(b)
+            combo_b.setCurrentText(a)
+            weight_a.setText(wb_t)
+            weight_b.setText(wa_t)
+            # A swapped pair no longer matches a curation preset index.
+            cur.blockSignals(True)
+            cur.setCurrentText("(custom)")
+            cur.blockSignals(False)
+            _on_load()
+
+        swap_btn = QPushButton("Swap")
+        swap_btn.setToolTip(
+            "Swap LoRA A ↔ B (slugs + weights) and load the swapped pair.\n"
+            "User-prompt field prefixes follow automatically."
+        )
+        swap_btn.clicked.connect(_on_swap)
+
         layout.addWidget(QLabel("idx"))
         layout.addWidget(cur)
         layout.addWidget(combo_a)
@@ -274,7 +332,11 @@ class ControlPanel(QWidget):
         layout.addWidget(combo_b)
         layout.addWidget(weight_b)
         layout.addWidget(btn)
+        layout.addWidget(swap_btn)
         self.main_layout.addWidget(container)
+        # NOTE: tuple stays at 6 entries — update_lora_options() and
+        # set_lora_selection() unpack it positionally; the Swap button
+        # needs no external handle.
         self.controls[param_id] = (cur, combo_a, weight_a, combo_b, weight_b, btn)
         self._lora_param_id = param_id
 

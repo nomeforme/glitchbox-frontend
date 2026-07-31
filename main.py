@@ -109,7 +109,19 @@ class MainWindow(QMainWindow):
         # Server render aspect for the camera thread's "Match server aspect"
         # crop. 4:3 (the production preset renders 1024x768) until the
         # session_ready capabilities deliver the session's true dimensions.
+        # ``_match_aspect`` is the source of truth for the toggle — the
+        # checkbox rendering it lives in the control panel and is rebuilt
+        # on every handshake, so state can't live in the widget.
         self._server_aspect = (4, 3)
+        self._match_aspect = True
+        # Per-side trigger prefixes currently prepended in the user-prompt
+        # A/B fields (e.g. "mrnabrmv style, jasblue mrnabrmv, "). Tracked
+        # so a LoRA swap/toggle can replace just the prefix while
+        # preserving what the user typed after it. "" = LoRAs disabled /
+        # none loaded. B is tracked even while the travel checkbox is off
+        # (field B empty + disabled) so enabling travel can prefill it.
+        self._prompt_prefix_a = ""
+        self._prompt_prefix_b = ""
         
         # Video input mode
         self.video_mode = False
@@ -283,21 +295,6 @@ class MainWindow(QMainWindow):
         camera_layout.addWidget(camera_label)
         camera_layout.addWidget(self.camera_spinbox)
         camera_layout.addWidget(self.camera_update_button)
-
-        # Capture aspect conditioning (client-side; the server never knows).
-        # Checked: center-crop capture to the server's render aspect so the
-        # server's stretch-resize is distortion-free (aspect arrives in the
-        # session_ready capabilities; 4:3 assumed until first connect).
-        # Unchecked: no crop — full sensor FOV, server stretch shows.
-        self.aspect_checkbox = QCheckBox("Match server aspect")
-        self.aspect_checkbox.setChecked(True)
-        self.aspect_checkbox.setToolTip(
-            "Center-crop the camera to the server's render aspect ratio\n"
-            "(distortion-free, slightly narrower FOV). Uncheck for the\n"
-            "full sensor FOV with the server's stretch visible."
-        )
-        self.aspect_checkbox.toggled.connect(self._on_match_aspect_toggled)
-        camera_layout.addWidget(self.aspect_checkbox)
 
         device_controls_layout.addLayout(camera_layout)
         
@@ -578,6 +575,9 @@ class MainWindow(QMainWindow):
             # accumulates even while the window is hidden, so opening it
             # mid-set shows the recent past, not a blank chart).
             self.ws_client_v2.soundlab_updated.connect(self._v2_handle_soundlab)
+            # LoRA trigger prefix for the user-prompt field (swap/toggle acks).
+            self.ws_client_v2.prompt_prefix_changed.connect(
+                self._apply_prompt_prefix)
             # Live-knob updates flow control_panel → ws_client_v2.update_knob
             self.control_panel.knob_changed.connect(self.ws_client_v2.update_knob)
             # LoRA hot-swap (Load button) → ws_client_v2.swap_lora
@@ -596,6 +596,13 @@ class MainWindow(QMainWindow):
             # _v2_restore_knobs replays this dict afterwards.
             self._knob_values: dict = {}
             self.control_panel.knob_changed.connect(self._v2_remember_knob)
+            # Dedicated-toggle signals (not live knobs): heavy LoRA
+            # enable/disable → server message; camera aspect crop →
+            # camera thread (client-only). Signals live on the persistent
+            # panel object, so one connect covers every rebuild.
+            self.control_panel.lora_toggle_changed.connect(self._on_lora_toggle)
+            self.control_panel.aspect_toggle_changed.connect(
+                self._on_match_aspect_toggled)
 
             # Audio thread (raw PCM, no client-side FFT). The client OWNS
             # its mic rate (CLIENT_SAMPLE_RATE) and ships it to the server
@@ -978,10 +985,38 @@ class MainWindow(QMainWindow):
         rest = {k: v for k, v in controls.items()
                 if v.get("group") != "audio"}
         if controls:
+            # Inject the CLIENT-side camera crop toggle so it renders among
+            # the server controls (it was unintuitive lodged next to the
+            # camera-index spinbox). Current state survives panel rebuilds
+            # because main.py owns it (self._match_aspect), not the widget.
+            rest["match_server_aspect"] = {
+                "field": "aspect_toggle", "order": 32,
+                "default": bool(self._match_aspect),
+                "title": "Match Server Aspect (camera crop)",
+                "group": "conditioning",
+            }
             self.control_panel.setup_pipeline_options(
                 {"input_params": {"properties": rest}}
             )
         self.control_panel.apply_capabilities(caps)
+        # User-travel gate: field B is enabled + prefix-seeded only while
+        # the travel checkbox is on. The checkbox is a fresh widget on
+        # every rebuild, so (re-)connect here and sync the initial state.
+        _travel_cb = self.control_panel.controls.get("user_travel_enabled")
+        _field_b = self.control_panel.controls.get("user_prompt_b")
+        if _travel_cb is not None and _field_b is not None:
+            _travel_cb.toggled.connect(self._on_user_travel_toggled)
+            _field_b.setEnabled(_travel_cb.isChecked())
+        # Seed the user-prompt fields with the active per-side LoRA trigger
+        # prefixes (schema carries them; "" when LoRAs are disabled). Runs
+        # BEFORE _v2_restore_knobs below so a remembered prompt (which
+        # already embeds its prefix) wins over the bare-prefix seed on
+        # reconnect.
+        self._prompt_prefix_a = ""   # fresh fields ⇒ no old prefix to strip
+        self._prompt_prefix_b = ""
+        self._apply_prompt_prefix(
+            (controls.get("user_prompt") or {}).get("prefix", ""),
+            (controls.get("user_prompt_b") or {}).get("prefix", ""))
         view = self._ensure_soundlab_view()
         view.build_audio_controls(audio_schema)
         view.set_graph_presets(caps.get("soundlab_graphs") or {})
@@ -1008,8 +1043,20 @@ class MainWindow(QMainWindow):
                 print("[UI/V2] No microphone detected → applied `ramp` "
                       "graph preset (client-side decision)")
 
+    # Knobs deliberately NOT remembered/restored across reconnects: the
+    # user-prompt override is per-session state. Restoring stale prompt
+    # text over the fresh prefix seed is what produced doubled prefixes
+    # ("mrnabrmv style, water mrnabrmv style, polygon monkey"), and users
+    # expect the prompt boxes to start clean each connect.
+    _EPHEMERAL_KNOBS = frozenset({
+        "user_prompt", "user_prompt_b",
+        "user_prompt_enabled", "user_travel_enabled",
+    })
+
     def _v2_remember_knob(self, field, value):
         """Track the latest value of each live knob (see _v2_restore_knobs)."""
+        if field in self._EPHEMERAL_KNOBS:
+            return
         self._knob_values[field] = value
 
     def _v2_remember_lora(self, slug_a, slug_b, weight_a, weight_b):
@@ -2145,7 +2192,7 @@ class MainWindow(QMainWindow):
         """
         self.camera_thread = CameraThread()
         self.camera_thread.device_index = self.camera_device_index
-        self.camera_thread.match_aspect = self.aspect_checkbox.isChecked()
+        self.camera_thread.match_aspect = self._match_aspect
         self.camera_thread.target_aspect = self._server_aspect
         self.camera_thread.frame_ready.connect(self.handle_camera_frame)
         if REALTIME_V2:
@@ -2155,12 +2202,86 @@ class MainWindow(QMainWindow):
     def _on_match_aspect_toggled(self, checked):
         """Live-toggle the camera thread's aspect crop (no restart needed —
         the capture loop reads the flag once per frame)."""
+        self._match_aspect = bool(checked)
         thread = getattr(self, "camera_thread", None)
         if thread is not None:
-            thread.match_aspect = bool(checked)
+            thread.match_aspect = self._match_aspect
         aw, ah = self._server_aspect
         print(f"[UI] Match server aspect: {'on' if checked else 'off'} "
               f"(target {aw}:{ah})")
+
+    @staticmethod
+    def _swap_field_prefix(field, old_prefix, new_prefix):
+        """Replace old_prefix with new_prefix at the head of a QLineEdit,
+        preserving whatever the user typed after it.
+
+        Idempotent: a field that already starts with new_prefix (repeated
+        ack, or tracking drifted from the visible text) is left alone
+        rather than double-prepended. Only a field matching neither prefix
+        (user edited the head away) gets new_prefix prepended wholesale.
+        """
+        text = field.text()
+        if old_prefix and text.startswith(old_prefix):
+            rest = text[len(old_prefix):]
+        elif new_prefix and text.startswith(new_prefix):
+            return  # already carries the target prefix — nothing to do
+        else:
+            rest = text
+        new_text = new_prefix + rest
+        if new_text != text:
+            field.setText(new_text)
+
+    def _apply_prompt_prefix(self, prefix_a, prefix_b):
+        """Swap the per-side LoRA trigger prefixes in the user-prompt A/B
+        fields.
+
+        setText fires textChanged → knob_changed → server update, so the
+        conditioning follows the visible text. LoRAs disabled → both
+        prefixes "" → the fields shed their prefixes; re-enabled or
+        swapped → the new triggers are prepended. Field B is only touched
+        while user travel is enabled (otherwise it stays empty+disabled;
+        the tracked B prefix seeds it when travel is turned on).
+        """
+        prefix_a = str(prefix_a or "")
+        prefix_b = str(prefix_b or "")
+        old_a, old_b = self._prompt_prefix_a, self._prompt_prefix_b
+        self._prompt_prefix_a = prefix_a
+        self._prompt_prefix_b = prefix_b
+        field_a = self.control_panel.controls.get("user_prompt")
+        if field_a is not None:
+            self._swap_field_prefix(field_a, old_a, prefix_a)
+        field_b = self.control_panel.controls.get("user_prompt_b")
+        travel_cb = self.control_panel.controls.get("user_travel_enabled")
+        if field_b is not None and travel_cb is not None and travel_cb.isChecked():
+            self._swap_field_prefix(field_b, old_b, prefix_b)
+        print(f"[UI/V2] user-prompt prefixes → A={prefix_a!r} B={prefix_b!r}")
+
+    def _on_user_travel_toggled(self, checked):
+        """Gate the user-prompt B field on the travel checkbox: enabled +
+        prefix-seeded while on; cleared + disabled while off (the clear
+        fires textChanged → the server's user_prompt_b empties too)."""
+        field_b = self.control_panel.controls.get("user_prompt_b")
+        if field_b is None:
+            return
+        if checked:
+            field_b.setEnabled(True)
+            if not field_b.text() and self._prompt_prefix_b:
+                field_b.setText(self._prompt_prefix_b)
+        else:
+            field_b.clear()
+            field_b.setEnabled(False)
+
+    def _on_lora_toggle(self, enabled):
+        """Forward the LoRAs Enabled checkbox to the server (heavy
+        swap-class op: strips/restores the fused LoRA stack, prompts and
+        travel untouched; the request/grant gate parks us for the stall)."""
+        if getattr(self, "ws_client_v2", None) is None or not self.ws_client_v2.connected:
+            return
+        print(f"[UI/V2] set_lora_enabled({bool(enabled)}) → server")
+        self.status_bar.update_processing_status(
+            f"{'Enabling' if enabled else 'Disabling'} LoRAs (brief stall)…"
+        )
+        self.ws_client_v2.set_lora_enabled(bool(enabled))
 
     def update_camera_index(self):
         """Update the camera device index"""
